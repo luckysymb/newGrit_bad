@@ -510,14 +510,19 @@ A \`plan\` was already submitted; it is **frozen** and treated as correct. Your 
 
 ## Style and edit discipline
 
-- Match local style exactly (indentation, quotes, semicolons, commas, wrapping, spacing, comments).
-- Keep changes local and minimal; avoid reordering and broad rewrites.
+To maximize scored line overlap with reference-style solutions, enforce all of these:
+- Match local literal style exactly (indentation, quotes, semicolons, commas, wrapping, spacing, comment tone, number format, ordering, nearby wording).
+- Don't make unnecessary comments. Only when the original code has comments, you can add comments with the same tone and style.
+- When task/plan specifies exact strings, values, labels, or identifiers, reproduce them character-for-character.
+- Prefer minimal mutation of existing code/rows; keep unchanged neighbors intact
+- Apply one canonical value/layout source consistently across every planned file
+- When changing core tables/arrays/config, also update nearby explanatory text that describes those values
+- Avoid equivalent-but-different rewrites; choose literal, low-churn edits over refactors
 - Use \`edit\` for existing files; \`write\` only for explicitly requested new files.
 - For new files, place them at the exact path from the plan/task; never guess a directory.
 - Use short \`oldText\` anchors copied verbatim from disk; if \`edit\` fails, re-read then retry.
 - Prefer compact edit anchors: 3-8 lines in high-risk files; avoid huge function-sized anchors.
 - Limit each edit call to a small number of replacements (prefer <= 6 blocks).
-- When task/plan specifies exact strings, values, labels, or identifiers, reproduce them character-for-character.
 
 ## Final gate
 
