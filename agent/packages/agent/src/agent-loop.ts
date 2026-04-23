@@ -27,19 +27,6 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
-/** Gemini (and Google-provider) models often mis-copy `oldText` or paths; give them on-disk truth. */
-function isGeminiModel(config: AgentLoopConfig): boolean {
-	const provider = String((config.model as { provider?: string })?.provider ?? "").toLowerCase();
-	const id = String((config.model as { id?: string })?.id ?? "").toLowerCase();
-	const name = String((config.model as { name?: string })?.name ?? "").toLowerCase();
-	return (
-		provider.includes("google") ||
-		provider.includes("gemini") ||
-		id.includes("gemini") ||
-		name.includes("gemini")
-	);
-}
-
 /** Large cap so typical repo files are included in full; extreme files still truncate to protect memory. */
 const GEMINI_EDIT_RECOVERY_MAX_CHARS = 8_000_000;
 
@@ -806,20 +793,6 @@ async function runLoop(
 			if (criterionNeedsFile(c, norm)) c.evidenceFiles.add(norm);
 		}
 	};
-	const unsatisfiedCriteria = (): CriterionLedgerItem[] => {
-		return acceptanceCriteria.filter((c) => {
-			if (c.requiredFiles.length === 0) return false;
-			// Each required file must have at least one evidence match.
-			return c.requiredFiles.some((rf) => {
-				const r = normalizePathForMatch(rf);
-				for (const e of c.evidenceFiles) {
-					const en = normalizePathForMatch(e);
-					if (en === r || en.endsWith("/" + r) || r.endsWith("/" + en)) return false;
-				}
-				return true;
-			});
-		});
-	};
 	const missingPlannedFiles = (): string[] => {
 		const missing: string[] = [];
 		for (const pf of plannedFiles) {
@@ -1064,6 +1037,8 @@ async function runLoop(
 	let lastToolSignature = "";
 	let repeatedToolSignatureCount = 0;
 	let lastSignatureMutationCount = 0;
+	const baselineFileContentByPath = new Map<string, string>();
+	const netChangedPaths = new Set<string>();
 	const siblingHintedReadDirs = new Set<string>();
 	let implementModeStartedAt: number | null = null;
 	/** Successful `edit` or `write` mutates disk — both must advance scoring-related loop state (was edit-only). */
@@ -1097,18 +1072,36 @@ async function runLoop(
 			],
 			timestamp: Date.now(),
 		});
-		if (firstMutation && !multiFileHintSent && (foundFiles.length >= 4 || pathsAlreadyRead.size >= 4)) {
+		if (firstMutation && !multiFileHintSent && plannedFiles.size >= 2) {
 			multiFileHintSent = true;
-			pendingMessages.push({
-				role: "user",
-				content: [
-					{
-						type: "text",
-						text: "You touched several candidate paths. Before stopping, verify every acceptance criterion is satisfied. Continue to another file only when a criterion, named path, or required wiring is still unmet.",
-					},
-				],
-				timestamp: Date.now(),
-			});
+			const remainingPlanned = missingPlannedFiles();
+			if (remainingPlanned.length > 0) {
+				pendingMessages.push({
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: `Plan-scoped reminder: remaining planned files not yet edited: ${remainingPlanned.slice(0, 6).map((f) => `\`${f}\``).join(", ")}. Continue implementing planned files only — do NOT edit off-plan files even if they seem related.`,
+						},
+					],
+					timestamp: Date.now(),
+				});
+			}
+		}
+	};
+	const refreshNetChangedStateForPath = (targetPath: string): void => {
+		const norm = normalizePathForMatch(targetPath);
+		if (!norm) return;
+		const baseline = baselineFileContentByPath.get(norm);
+		if (typeof baseline !== "string") return;
+		try {
+			const { abs, ok } = safeResolvePathUnderCwd(norm);
+			if (!ok || !existsSync(abs)) return;
+			const current = readFileSync(abs, "utf8");
+			if (current === baseline) netChangedPaths.delete(norm);
+			else netChangedPaths.add(norm);
+		} catch {
+			// best-effort only
 		}
 	};
 	const maybeAddBreadthHintAfterRead = (readPath: string): void => {
@@ -1307,6 +1300,15 @@ async function runLoop(
 					missingPlannedFiles().length > 0 ||
 					needsDeeperPlannedImplementation().length > 0
 				);
+			const forceImplementMutationChoice =
+				executionMode === "implement" &&
+				implementNeedsProgress &&
+				implementReadOnlyRequiredTurns >= IMPLEMENT_READ_ONLY_REQUIRED_TURN_LIMIT;
+			// During CONFIRMPLAN the model is expected to reply with `PERFECT` as plain text
+			// (no tool) or `IMPERFECT` + edit/write. "required"/forced edit would block the
+			// PERFECT path and trap the loop until the hard cutoff. Relax tool choice here.
+			const isConfirmTurn =
+				executionMode === "implement" && confirmPhaseStarted && confirmCurrentPath !== null;
 
 			const message = await streamAssistantResponse(
 				currentContext,
@@ -1323,7 +1325,13 @@ async function runLoop(
 								? ({ type: "function", function: { name: "plan" } } as const)
 								: ("required" as const)
 							: executionMode === "implement"
-								? ("required" as const)
+								? (
+									isConfirmTurn
+										? ("auto" as const)
+										: forceImplementMutationChoice
+											? ({ type: "function", function: { name: "edit" } } as const)
+											: ("required" as const)
+								)
 								: implementNeedsProgress
 									? ("required" as const)
 									: undefined,
@@ -1559,9 +1567,16 @@ async function runLoop(
 						const tr = toolResults[i];
 						const tc = toolCalls[i];
 						if (!tc || tc.type !== "toolCall" || tc.name !== "plan") continue;
+						const rawPlanArgs = tc.arguments ?? {};
+						await emitRolloutMarker("plan_tool_args", {
+							args: rawPlanArgs,
+						});
 						const planTimeoutExceeded = (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
 						if (tr.isError) {
 							const errText = tr.content?.map((c: any) => c?.text ?? "").join("") ?? "unknown plan validation error";
+							await emitRolloutMarker("plan_validation_error", {
+								error: errText,
+							});
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: planTimeoutExceeded ? `PLAN timeout reached, but submitted plan is still invalid: ${errText}. Re-submit \`plan\` immediately with corrected paths/structure. Keep it concise but valid.` : `Plan submission failed: ${errText}. Fix and call \`plan\` again.` }],
@@ -1598,6 +1613,9 @@ async function runLoop(
 							continue;
 						}
 						const plans = extractPlanItems(tc.arguments);
+						await emitRolloutMarker("plan_extracted", {
+							plans,
+						});
 						if (plans.length === 0 && !planTimeoutExceeded) {
 							pendingMessages.push({
 								role: "user",
@@ -1623,10 +1641,43 @@ async function runLoop(
 							if (typeof p?.plan === "string" && p.plan.trim().length > 0) planByFile.set(np, p.plan.trim());
 							if (!foundFiles.includes(np)) foundFiles.push(np);
 						}
-						await emitRolloutMarker("plan_submitted", {
-							plan_count: plans.length,
-							paths: plans.map((p) => (typeof p?.path === "string" ? normalizePathForMatch(p.path.trim()) : "")).filter((p) => p.length > 0),
-						});
+						{
+							const lines: string[] = [];
+							const submittedAtMs = Date.now();
+							const submittedAtIso = new Date(submittedAtMs).toISOString();
+							const elapsedMs = submittedAtMs - loopStart;
+							const elapsedSec = (elapsedMs / 1000).toFixed(2);
+							lines.push(
+								`[plan] submitted ${plans.length} item(s) submitted_at=${submittedAtIso} elapsed_since_loop_start_ms=${elapsedMs} submitted_ts_ms=${submittedAtMs} elapsed_since_loop_start_s=${elapsedSec}`,
+							);
+							for (let idx = 0; idx < plans.length; idx++) {
+								const p: any = plans[idx];
+								const pathText = typeof p?.path === "string" ? p.path.trim() : "";
+								const isNew = Boolean(p?.is_new_file);
+								const acceptanceRefs = Array.isArray(p?.acceptance_criteria)
+									? p.acceptance_criteria.filter((c: unknown) => typeof c === "string" && c.trim().length > 0)
+									: [];
+								const planText = typeof p?.plan === "string" ? p.plan.trim() : "";
+								lines.push(`#${idx + 1} path=${pathText} is_new_file=${isNew} submitted_at=${submittedAtIso} elapsed_since_loop_start_ms=${elapsedMs}`);
+								if (acceptanceRefs.length > 0) {
+									lines.push(`acceptance_criteria=${acceptanceRefs.join(" | ")}`);
+								}
+								lines.push("plan:");
+								lines.push(planText || "(empty)");
+								lines.push("---");
+							}
+							process.stdout.write(`${lines.join("\n")}\n`);
+						}
+						{
+							const submittedAtMs = Date.now();
+							await emitRolloutMarker("plan_submitted", {
+								plan_count: plans.length,
+								paths: plans.map((p) => (typeof p?.path === "string" ? normalizePathForMatch(p.path.trim()) : "")).filter((p) => p.length > 0),
+								submitted_at: new Date(submittedAtMs).toISOString(),
+								submitted_ts_ms: submittedAtMs,
+								elapsed_since_loop_start_ms: submittedAtMs - loopStart,
+							});
+						}
 						planSubmitted = true;
 						executionMode = "implement";
 						implementModeStartedAt = Date.now();
@@ -1770,15 +1821,28 @@ async function runLoop(
 				}
 				if (!hasMoreToolCalls) {
 					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [{
-							type: "text",
-							text: "IMPLEMENT mode requires tool calls every turn. Call `read`, `edit`, or `write` now for planned files only.",
-						}],
-						timestamp: Date.now(),
-					});
-					continue;
+					// Only require a tool call when planned implementation work is still pending.
+					// If all planned files are already edited and the confirm phase has not started,
+					// let flow fall through to the bottom-of-loop exit gate so the confirm phase
+					// can be initiated. Otherwise we would spin in a "requires tool calls" loop
+					// and the confirm phase would never start.
+					// If the confirm phase is already running, the CONFIRMPLAN reply handler above
+					// has already pushed its own reminder and `continue`d, so this branch only
+					// runs when confirm is not active.
+					if (implementNeedsProgress && !confirmPhaseStarted) {
+						pendingMessages.push({
+							role: "user",
+							content: [{
+								type: "text",
+								text: "IMPLEMENT mode requires tool calls every turn. Call `read`, `edit`, or `write` now for planned files only.",
+							}],
+							timestamp: Date.now(),
+						});
+						continue;
+					}
+					// No planned work left AND confirm not started -> allow fall-through so the
+					// exit-gate at the bottom of the loop can start the confirm phase on the next
+					// iteration.
 				}
 				if (hasMoreToolCalls) {
 					const implementAllowed = new Set(["read", "edit", "write"]);
@@ -1852,10 +1916,16 @@ async function runLoop(
 						if (!targetPath) continue;
 						if (tr.isError) {
 							const errText = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-							if (pendingMessages.length === 0) pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit failed on \`${targetPath}\`. Call \`read\` on this file and retry with an exact oldText anchor.` }], timestamp: Date.now() });
-							if (isGeminiModel(config)) pendingMessages.push({ role: "user", content: [{ type: "text", text: buildGeminiEditFailureRecoveryMessage(targetPath, errText, tc, foundFiles) }], timestamp: Date.now() });
+							if (pendingMessages.length === 0) {
+								pendingMessages.push({
+									role: "user",
+									content: [{ type: "text", text: buildGeminiEditFailureRecoveryMessage(targetPath, errText, tc, foundFiles) }],
+									timestamp: Date.now(),
+								});
+							}
 						} else {
 							await recordSuccessfulFileMutation(targetPath);
+							refreshNetChangedStateForPath(targetPath);
 						}
 					}
 
@@ -1870,6 +1940,10 @@ async function runLoop(
 						if (!isFullRead) continue;
 						addReadPathVariants(pathsAlreadyRead, readPath);
 						const normRead = normalizePathForMatch(readPath);
+						const readText = tr.content?.map((c: any) => c?.text ?? "").join("") ?? "";
+						if (!baselineFileContentByPath.has(normRead) && readText.length > 0) {
+							baselineFileContentByPath.set(normRead, readText);
+						}
 						const planText = planByFile.get(normRead) ?? "";
 						if (pendingMessages.length === 0) {
 							pendingMessages.push({
@@ -1892,6 +1966,17 @@ async function runLoop(
 				planSubmitted &&
 				pendingMessages.length === 0
 			) {
+				if (executionMode === "implement" && netChangedPaths.size === 0) {
+					pendingMessages.push({
+						role: "user",
+						content: [{
+							type: "text",
+							text: "No net persisted edits detected yet. Continue implement mode with concrete edit/write calls that leave actual file changes.",
+						}],
+						timestamp: Date.now(),
+					});
+					continue;
+				}
 				await emit({ type: "turn_end", message, toolResults });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -1917,6 +2002,17 @@ async function runLoop(
 				implementModeStartedAt !== null &&
 				(Date.now() - implementModeStartedAt) >= GRACEFUL_EXIT_MS
 			) {
+				if (netChangedPaths.size === 0) {
+					pendingMessages.push({
+						role: "user",
+						content: [{
+							type: "text",
+							text: "No net file changes are currently detected versus earlier reads. Do not stop. Re-read target planned files and apply concrete edits that persist on disk.",
+						}],
+						timestamp: Date.now(),
+					});
+					continue;
+				}
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
@@ -1936,25 +2032,12 @@ async function runLoop(
 		) {
 			break;
 		}
-		// Hard stop gate: if explicit/named target files from criteria are still untouched, continue editing.
-		if (hasProducedEdit) {
-			const unsatisfied = unsatisfiedCriteria();
-			if (unsatisfied.length > 0) {
-				const preview = unsatisfied
-					.slice(0, 4)
-					.map((c) => `#${c.id} -> ${c.requiredFiles.map((f) => `\`${f}\``).join(", ")}`)
-					.join("; ");
-				pendingMessages = [{
-					role: "user",
-					content: [{
-						type: "text",
-						text: `Do not stop. Criterion ledger has unsatisfied explicit-file criteria: ${preview}. Continue editing those files until each criterion has evidence.`,
-					}],
-					timestamp: Date.now(),
-				}];
-				continue;
-			}
-		}
+		// IMPORTANT: In IMPLEMENT mode, plans are the frozen contract. Do NOT nudge the model
+		// about task-derived "expected/explicit/criterion" files, because they can include
+		// files that were never planned (e.g., sibling modules surfaced by PLAN-mode discovery).
+		// Any off-plan nudge here distracts the model and forces out-of-scope edits.
+		// Plan-scoped exit gates below (missingPlannedFiles / needsDeeperPlannedImplementation)
+		// are the ONLY allowed post-edit continue signals in IMPLEMENT mode.
 		if (executionMode === "plan") {
 			pendingMessages = [{
 				role: "user",
