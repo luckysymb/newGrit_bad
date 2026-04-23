@@ -174,6 +174,7 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 				throw new Error("plan requires at least one valid { path, plan, is_new_file } item");
 			}
 			ensureShellValidationToolsAvailable();
+			const autoNormalizedExistingPaths: string[] = [];
 			const validationResults: PlanValidationResult[] = normalized.map((item) => {
 				const normalizedPlanText = addMissingRequiredSections(item.plan, item.acceptance_criteria);
 				if (item.acceptance_criteria.length === 0) {
@@ -193,13 +194,20 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 						message: detailValidation.reason ?? "failed: insufficient plan detail",
 					};
 				}
-				if (item.is_new_file) {
+				const resolved = resolveWorkspacePath(item.path, cwd, { kind: "file", basenameFallback: false });
+				const abs = resolveToCwd(resolved, cwd);
+				const existingAtExactPath = fileExistsViaTest(abs);
+				const effectiveIsNewFile = item.is_new_file && !existingAtExactPath;
+				if (item.is_new_file && existingAtExactPath) {
+					autoNormalizedExistingPaths.push(item.path);
+				}
+				if (effectiveIsNewFile) {
 					const fileName = basename(item.path.replace(/\/+$/, ""));
 					const conflicts = findPathsByBasenameViaFind(cwd, fileName, 32);
 					if (conflicts.length > 0) {
 						return {
 							path: item.path,
-							is_new_file: true,
+							is_new_file: effectiveIsNewFile,
 							validation_result: "failed",
 							message: "failed: is_new_file but a file with this basename already exists",
 							suggested_paths: conflicts,
@@ -207,26 +215,26 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 					}
 					return {
 						path: item.path,
-						is_new_file: true,
+						is_new_file: effectiveIsNewFile,
 						validation_result: "passed",
 						message: "passed",
 					};
 				}
-				const resolved = resolveWorkspacePath(item.path, cwd, { kind: "file", basenameFallback: false });
-				const abs = resolveToCwd(resolved, cwd);
 				if (fileExistsViaTest(abs)) {
 					return {
 						path: item.path,
-						is_new_file: false,
+						is_new_file: effectiveIsNewFile,
 						validation_result: "passed",
-						message: "passed",
+						message: item.is_new_file && existingAtExactPath
+							? "passed: normalized is_new_file=false because path already exists"
+							: "passed",
 					};
 				}
 				const fileName = basename(item.path.replace(/\/+$/, ""));
 				const suggestions = findPathsByBasenameViaFind(cwd, fileName, 20);
 				return {
 					path: item.path,
-					is_new_file: false,
+					is_new_file: effectiveIsNewFile,
 					validation_result: "failed",
 					message: suggestions.length > 0 ? "failed: path not found; suggestions available" : "failed: path not found",
 					suggested_paths: suggestions,
@@ -251,13 +259,16 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 					: "";
 				return `#${idx + 1} ${r.path} => failed${suggestions}`;
 			});
+			const normalizationNote = autoNormalizedExistingPaths.length > 0
+				? `Auto-normalization: set is_new_file=false for existing path(s): ${[...new Set(autoNormalizedExistingPaths)].join(", ")}\n`
+				: "";
 			return {
 				content: [
 					{
 						type: "text",
 						text: allPassed
-							? `Plan validation passed for all ${normalized.length} file(s).\nValidation_result:\n${reportLines.join("\n")}`
-							: `Plan validation failed. Fix failed paths/criteria coverage and call plan again.\nEach plan item must be detailed and include sections: Scope:, Edits:, Acceptance:, Verification:.\n${!criteriaAllCovered ? `Uncovered acceptance criteria: ${uncoveredCriteria.slice(0, 10).join(" | ")}\n` : ""}Validation_result:\n${reportLines.join("\n")}`,
+							? `Plan validation passed for all ${normalized.length} file(s).\n${normalizationNote}Validation_result:\n${reportLines.join("\n")}`
+							: `Plan validation failed. Fix failed paths/criteria coverage and call plan again.\nEach plan item must be detailed and include sections: Scope:, Edits:, Acceptance:, Verification:.\n${normalizationNote}${!criteriaAllCovered ? `Uncovered acceptance criteria: ${uncoveredCriteria.slice(0, 10).join(" | ")}\n` : ""}Validation_result:\n${reportLines.join("\n")}`,
 					},
 				],
 				details: {

@@ -607,6 +607,7 @@ async function runLoop(
 	let earlyNudgeSent = false;
 	let urgentNudgeSent = false;
 	let finalNudgeSent = false;
+	let implementReadOnlyRequiredTurns = 0;
 	const pathsAlreadyRead = new Set<string>();
 	const pathReadCounts = new Map<string, number>();
 	let lastRereadNudgeAt = 0;
@@ -617,6 +618,10 @@ async function runLoop(
 
 	let executionMode: "plan" | "implement" = "plan";
 	let planSubmitted = false;
+	let confirmPhaseStarted = false;
+	let confirmPhaseDone = false;
+	let confirmCurrentPath: string | null = null;
+	const confirmPlanList = new Set<string>();
 	const pendingTurnEndMarkerLines: string[] = [];
 	const rawEmit = emit;
 	emit = async (event: AgentEvent) => {
@@ -784,7 +789,7 @@ async function runLoop(
 	const allowedToolsForMode = (mode: "plan" | "implement"): Set<string> =>
 		mode === "plan"
 			? new Set(["bash", "find", "grep", "ls", "read", "plan"])
-			: new Set(["read", "edit", "write", "bash", "grep", "find", "ls"]);
+			: new Set(["read", "edit", "write"]);
 	const emitRolloutMarker = async (name: string, payload: Record<string, unknown> = {}): Promise<void> => {
 		const marker = {
 			type: name,
@@ -844,8 +849,68 @@ async function runLoop(
 		}
 		return missing;
 	};
+	const needsDeeperPlannedImplementation = (): string[] => {
+		const needsMore: string[] = [];
+		for (const pf of plannedFiles) {
+			const normPf = normalizePathForMatch(pf);
+			const planText = planByFile.get(normPf) ?? "";
+			if (!planText) continue;
+			const backtickRefs = (planText.match(/`[^`]+`/g) ?? []).length;
+			const hasDetailedEdits = planText.length >= 500 || backtickRefs >= 6;
+			if (!hasDetailedEdits) continue;
+			const editCount = pathEditCounts.get(normPf) ?? 0;
+			if (editCount < 2) needsMore.push(pf);
+		}
+		return needsMore;
+	};
+	const isPathEdited = (path: string): boolean => {
+		const n = normalizePathForMatch(path);
+		return editedPaths.has(n) || editedPaths.has("./" + n) || editedPaths.has(path);
+	};
+	const buildConfirmPrompt = (path: string): AgentMessage => {
+		const normPath = normalizePathForMatch(path);
+		const planText = planByFile.get(normPath) ?? "";
+		let fileContent = "";
+		try {
+			const { abs, ok } = safeResolvePathUnderCwd(normPath);
+			if (ok && existsSync(abs)) fileContent = readFileSync(abs, "utf8");
+		} catch {
+			fileContent = "";
+		}
+		const body = fileContent.length > 0 ? fileContent : "(file content unavailable)";
+		return {
+			role: "user",
+			content: [{
+				type: "text",
+				text:
+					`CONFIRMPLAN CHECK for \`${normPath}\`.\n` +
+					`Plan for this file:\n---\n${planText || "(missing plan text)"}\n---\n\n` +
+					`FULL edited file content:\n---\n${escapeMarkdownFences(body)}\n---\n\n` +
+					`Reply rules:\n` +
+					`- If perfect: reply exactly \`PERFECT\` (no tool call).\n` +
+					`- If imperfect: reply \`IMPERFECT\` and include an \`edit\` or \`write\` tool call for this same file in the same turn.\n` +
+					`- Do not switch files during this confirm step.`,
+			}],
+			timestamp: Date.now(),
+		};
+	};
+	const queueNextConfirmPrompt = (): boolean => {
+		if (confirmPlanList.size === 0) {
+			confirmCurrentPath = null;
+			confirmPhaseDone = true;
+			return false;
+		}
+		confirmCurrentPath = [...confirmPlanList][0] ?? null;
+		if (!confirmCurrentPath) {
+			confirmPhaseDone = true;
+			return false;
+		}
+		pendingMessages.push(buildConfirmPrompt(confirmCurrentPath));
+		return true;
+	};
 	const PLAN_MODE_MAX_MS = 100_000;
 	const IMPLEMENT_VERIFY_MAX_MS = 200_000;
+	const IMPLEMENT_READ_ONLY_REQUIRED_TURN_LIMIT = 3;
 	const hasFullReadForPath = (path: string): boolean => {
 		const norm = normalizePathForMatch(path);
 		return pathsAlreadyRead.has(norm) || pathsAlreadyRead.has("./" + norm);
@@ -1287,9 +1352,16 @@ async function runLoop(
 				firstTurn = false;
 			}
 
+			// Hard session cap must run every iteration — many `continue` paths skip the tool tail,
+			// so a bottom-only check lets the loop run until an external harness timeout.
+			if ((Date.now() - loopStart) >= ABSOLUTE_SESSION_CAP_MS) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
 			// Process pending messages (inject before next assistant response)
 			if (pendingMessages.length > 0) {
-				if (executionMode === "implement") {
+				{
 					pendingMessages = pendingMessages.filter((m) => !isPlanSteeringMessage(m));
 				}
 				for (const message of pendingMessages) {
@@ -1309,6 +1381,15 @@ async function runLoop(
 						: currentContext.tauSystemPrompts.implement
 					: currentContext.systemPrompt;
 
+			const planBudgetExceeded =
+				executionMode === "plan" && !planSubmitted && (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
+			const implementNeedsProgress =
+				executionMode === "implement" &&
+				(
+					missingPlannedFiles().length > 0 ||
+					needsDeeperPlannedImplementation().length > 0
+				);
+
 			const message = await streamAssistantResponse(
 				currentContext,
 				config,
@@ -1317,7 +1398,17 @@ async function runLoop(
 				streamFn,
 				{
 					// PLAN mode must never burn turns on prose-only replies; Gemini often does that unless forced.
-					toolChoice: executionMode === "plan" && !planSubmitted ? ("required" as const) : undefined,
+					// After the PLAN wall clock budget, force a real `plan` tool call so discovery-only loops cannot stall.
+					toolChoice:
+						executionMode === "plan" && !planSubmitted
+							? planBudgetExceeded
+								? ({ type: "function", function: { name: "plan" } } as const)
+								: ("required" as const)
+							: executionMode === "implement"
+								? ("required" as const)
+								: implementNeedsProgress
+									? ("required" as const)
+									: undefined,
 				},
 				llmSystemPrompt,
 			);
@@ -1360,818 +1451,283 @@ async function runLoop(
 			}
 			hasMoreToolCalls = toolCalls.length > 0;
 			const hasPlanToolCall = toolCalls.some((tc) => tc.name === "plan");
-			if (executionMode === "plan" && hasPlanToolCall && expectedFiles.length > 0) {
-				const undiscovered = undiscoveredExpectedFiles();
-				if (undiscovered.length > 0) {
-					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [{
-							type: "text",
-							text: `Before calling \`plan\`, discover expected files first. Call \`read\` (full file) on: ${undiscovered
-								.slice(0, 12)
-								.map((f) => `\`${f}\``)
-								.join(", ")}.`,
-						}],
-						timestamp: Date.now(),
-					});
-					hasMoreToolCalls = false;
-					continue;
-				}
-			}
-			if (executionMode === "plan" && hasMoreToolCalls) {
-				const hasMutationAttempt = toolCalls.some((tc) => {
-					if (tc.name === "edit" || tc.name === "write") return true;
-					if (tc.name !== "bash") return false;
-					const cmd = String((tc.arguments as { command?: string } | undefined)?.command ?? "");
-					return isMutatingBashCommand(cmd);
-				});
-				const hasNetworkProbe = toolCalls.some((tc) => {
-					if (tc.name !== "bash") return false;
-					const cmd = String((tc.arguments as { command?: string } | undefined)?.command ?? "");
-					return isNetworkProbeBashCommand(cmd);
-				});
-				if (hasMutationAttempt) {
-					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: "Still in PLAN mode. File mutations are forbidden before plan submission (`edit`/`write` and mutating `bash` commands). Continue broad discovery and then call `plan` with JSON plans.",
-							},
-						],
-						timestamp: Date.now(),
-					});
-					hasMoreToolCalls = false;
-					continue;
-				}
-				if (hasNetworkProbe) {
-					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: "PLAN mode forbids network/probe bash commands (they often fail with ConnectionRefusedError in eval sandboxes). Use only local repository discovery tools and then call `plan`.",
-							},
-						],
-						timestamp: Date.now(),
-					});
-					hasMoreToolCalls = false;
-					continue;
-				}
-			}
-			if (executionMode === "plan" && (Date.now() - loopStart) >= PLAN_MODE_MAX_MS && pendingMessages.length === 0) {
-				// Critical: after timeout, still allow explicit `plan` submissions to execute.
-				// Otherwise the loop can deadlock in PLAN mode even when the model calls `plan`.
-				if (!hasPlanToolCall) {
-					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: "Plan mode timeout reached (~100s). Stop exploration now. Do one final coverage check (each criterion -> file) and call only the `plan` tool with detailed JSON plans.",
-							},
-						],
-						timestamp: Date.now(),
-					});
-					hasMoreToolCalls = false;
-					continue;
-				}
-			}
-			if (!hasMoreToolCalls && executionMode === "plan") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				pendingMessages.push({
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: "You are still in PLAN mode. Your last turn had no effective planning progress. Follow right-search order now: grep exact task terms -> read owner file(s) -> sweep required wiring neighbors -> criterion-to-file coverage check -> call `plan`. Use JSON: { \"plans\": [{ \"path\": \"...\", \"plan\": \"...\", \"is_new_file\": false }, ...] }.",
-						},
-					],
-					timestamp: Date.now(),
-				});
-				continue;
-			}
-
-			if (!hasMoreToolCalls && emptyTurnRetries < EMPTY_TURN_MAX) {
-				const tokenCapped = message.stopReason === "length";
-				const idleStopped = message.stopReason === "stop" && !hasProducedEdit;
-				if (tokenCapped || idleStopped) {
-					emptyTurnRetries++;
-					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: tokenCapped
-									? "Output budget consumed without any tool invocation. Invoke \`read\`, \`edit\`, or \`write\` now. Text output contributes nothing to your score."
-									: "No file modifications detected. A blank diff receives zero points. Use \`read\` on the primary file, then \`edit\` or \`write\` it immediately.",
-							},
-						],
-						timestamp: Date.now(),
-					});
-					continue;
-				}
-			}
-
-			// ZERO-DIFF PREVENTION: model wants to stop but has no edits at all
-			if (!hasMoreToolCalls && !hasProducedEdit && emptyTurnRetries >= EMPTY_TURN_MAX && pathsAlreadyRead.size > 0) {
-				emptyTurnRetries = 0; // reset to allow more retries
-				const topFile = foundFiles[0] || [...pathsAlreadyRead][0] || "";
-				await emit({ type: "turn_end", message, toolResults: [] });
-				pendingMessages.push({
-					role: "user",
-					content: [{ type: "text", text: `You are about to finish with ZERO file changes. This guarantees a loss. You read \`${topFile}\`. Apply \`edit\` or \`write\` now — even a partial or imperfect change scores more than nothing.` }],
-					timestamp: Date.now(),
-				});
-				hasMoreToolCalls = false;
-				continue;
-			}
-
 			const toolResults: ToolResultMessage[] = [];
-			if (hasMoreToolCalls) {
-				const allowed = allowedToolsForMode(executionMode);
-				const disallowed = toolCalls.filter((tc) => !allowed.has(tc.name));
-				if (disallowed.length > 0) {
-					await emit({ type: "turn_end", message, toolResults: [] });
-					const blocked = disallowed.map((tc) => `\`${tc.name}\``).join(", ");
-					const allowList = [...allowed].map((n) => `\`${n}\``).join(", ");
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: `Mode violation: ${blocked} is not allowed in ${executionMode.toUpperCase()} mode. Allowed tools: ${allowList}.`,
-							},
-						],
-						timestamp: Date.now(),
-					});
-					hasMoreToolCalls = false;
-					continue;
-				}
-				// Patch-shape guardrails before executing tools: prevent giant noisy edits and enforce compact anchors on risky files.
-				for (const tc of toolCalls) {
-					if (!tc || tc.type !== "toolCall" || tc.name !== "edit") continue;
-					const tPath = resolvedLoopPathForTool(tc) ?? "";
-					const args = (tc.arguments as any) ?? {};
-					const edits = Array.isArray(args.edits) ? args.edits : [];
-					if (edits.length > 6) {
+			if (executionMode === "plan") {
+				if (hasPlanToolCall && expectedFiles.length > 0 && !planBudgetExceeded) {
+					const undiscovered = undiscoveredExpectedFiles();
+					if (undiscovered.length > 0) {
+						await emit({ type: "turn_end", message, toolResults: [] });
 						pendingMessages.push({
 							role: "user",
-							content: [{ type: "text", text: `Edit call on \`${tPath || "unknown file"}\` has ${edits.length} blocks. Split into smaller calls (max 6 blocks) to reduce mismatch and over-edit risk.` }],
+							content: [{
+								type: "text",
+								text: `Before calling \`plan\`, discover expected files first. Call \`read\` (full file) on: ${undiscovered
+									.slice(0, 12)
+									.map((f) => `\`${f}\``)
+									.join(", ")}.`,
+							}],
 							timestamp: Date.now(),
 						});
 						hasMoreToolCalls = false;
-						break;
+						continue;
 					}
-					for (const e of edits) {
-						const oldText = typeof e?.oldText === "string" ? e.oldText : "";
-						if (!oldText) continue;
-						const oldLines = editOldTextLineCount(oldText);
-						if (oldLines > 160) {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: `Edit oldText on \`${tPath || "unknown file"}\` is too large (${oldLines} lines). Use compact anchors (3-8 lines, max 80 lines absolute) and split edits.` }],
-								timestamp: Date.now(),
-							});
-							hasMoreToolCalls = false;
-							break;
-						}
-						if (highRiskEditFiles.has(tPath) && (oldLines < 3 || oldLines > 8)) {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: `\`${tPath}\` is in high-risk compact-anchor mode. oldText must be 3-8 lines copied verbatim from a fresh read.` }],
-								timestamp: Date.now(),
-							});
-							hasMoreToolCalls = false;
-							break;
-						}
-					}
-					if (!hasMoreToolCalls) break;
 				}
-				if (planSubmitted && hasMoreToolCalls) {
-					for (const tc of toolCalls) {
-						if (!tc || tc.type !== "toolCall") continue;
-						if (tc.name === "plan") {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: "Plan is immutable in IMPLEMENT mode. Do not call `plan` again; implement existing plans only." }],
-								timestamp: Date.now(),
-							});
-							hasMoreToolCalls = false;
-							break;
-						}
-						if (tc.name !== "edit" && tc.name !== "write") continue;
-						const targetPath = resolvedLoopPathForTool(tc);
-						if (!targetPath) continue;
-						const normTarget = normalizePathForMatch(targetPath);
-						if (plannedFiles.size > 0) {
-							let inPlan = false;
-							for (const pf of plannedFiles) {
-								const pn = normalizePathForMatch(pf);
-								if (normTarget === pn || normTarget.endsWith("/" + pn) || pn.endsWith("/" + normTarget)) {
-									inPlan = true;
-									break;
-								}
-							}
-							if (!inPlan) {
-								pendingMessages.push({
-									role: "user",
-									content: [{ type: "text", text: `\`${targetPath}\` is outside frozen plans. Implement mode may edit only planned files.` }],
-									timestamp: Date.now(),
-								});
-								hasMoreToolCalls = false;
-								break;
-							}
-						}
-						const isExistingFile = (() => {
-							const { abs, ok } = safeResolvePathUnderCwd(normTarget);
-							return ok && existsSync(abs);
-						})();
-						if ((tc.name === "edit" || isExistingFile) && !hasFullReadForPath(normTarget)) {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: `Read-first rule: call \`read\` on \`${targetPath}\` (full file, no offset/limit) before \`${tc.name}\`.` }],
-								timestamp: Date.now(),
-							});
-							hasMoreToolCalls = false;
-							break;
-						}
+				if (hasMoreToolCalls) {
+					const hasMutationAttempt = toolCalls.some((tc) => {
+						if (tc.name === "edit" || tc.name === "write") return true;
+						if (tc.name !== "bash") return false;
+						const cmd = String((tc.arguments as { command?: string } | undefined)?.command ?? "");
+						return isMutatingBashCommand(cmd);
+					});
+					const hasNetworkProbe = toolCalls.some((tc) => {
+						if (tc.name !== "bash") return false;
+						const cmd = String((tc.arguments as { command?: string } | undefined)?.command ?? "");
+						return isNetworkProbeBashCommand(cmd);
+					});
+					if (hasMutationAttempt) {
+						await emit({ type: "turn_end", message, toolResults: [] });
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: "Still in PLAN mode. File mutations are forbidden before plan submission (`edit`/`write` and mutating `bash` commands). Continue broad discovery and then call `plan` with JSON plans." }],
+							timestamp: Date.now(),
+						});
+						hasMoreToolCalls = false;
+						continue;
 					}
+					if (hasNetworkProbe) {
+						await emit({ type: "turn_end", message, toolResults: [] });
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: "PLAN mode forbids network/probe bash commands (they often fail with ConnectionRefusedError in eval sandboxes). Use only local repository discovery tools and then call `plan`." }],
+							timestamp: Date.now(),
+						});
+						hasMoreToolCalls = false;
+						continue;
+					}
+				}
+				if ((Date.now() - loopStart) >= PLAN_MODE_MAX_MS && pendingMessages.length === 0 && !hasPlanToolCall) {
+					await emit({ type: "turn_end", message, toolResults: [] });
+					pendingMessages.push({
+						role: "user",
+						content: [{ type: "text", text: "Plan mode timeout reached (~100s). Stop exploration now. Do one final coverage check (each criterion -> file) and call only the `plan` tool with detailed JSON plans." }],
+						timestamp: Date.now(),
+					});
+					hasMoreToolCalls = false;
+					continue;
 				}
 				if (!hasMoreToolCalls) {
 					await emit({ type: "turn_end", message, toolResults: [] });
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "You are still in PLAN mode. Your last turn had no effective planning progress. Follow right-search order now: grep exact task terms -> read owner file(s) -> sweep required wiring neighbors -> criterion-to-file coverage check -> call `plan`. Use JSON: { \"plans\": [{ \"path\": \"...\", \"plan\": \"...\", \"is_new_file\": false }, ...] }.",
+							},
+						],
+						timestamp: Date.now(),
+					});
 					continue;
 				}
-
-				const toolSignature = toolCalls.map((tc: any) => {
-					if (!tc || tc.type !== "toolCall") return "invalid";
-					const args = tc.arguments as Record<string, unknown> | undefined;
-					const p = typeof args?.path === "string" ? args.path : "";
-					const fp = typeof args?.file_path === "string" ? args.file_path : "";
-					return `${tc.name}:${p || fp}`;
-				}).join("|");
-				if (toolSignature.length > 0) {
-					if (toolSignature === lastToolSignature) {
-						repeatedToolSignatureCount++;
-					} else {
-						lastToolSignature = toolSignature;
-						repeatedToolSignatureCount = 1;
-						lastSignatureMutationCount = successfulMutationCount;
-					}
-				}
-
-				toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
-
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
-				}
-
-				for (let i = 0; i < toolResults.length; i++) {
-					const tr = toolResults[i];
-					const tc = toolCalls[i];
-					if (!tc || tc.type !== "toolCall") continue;
-
-					if (tc.name === "write") {
-						const targetPath = resolvedLoopPathForTool(tc);
-						if (!targetPath) continue;
-						if (tr.isError) {
-							if (pendingMessages.length === 0) {
-								pendingMessages.push({
-									role: "user",
-									content: [
-										{
-											type: "text",
-											text: `Write failed for \`${targetPath}\`. Check path and arguments; retry with \`write\` or switch to \`edit\` on an existing file.`,
-										},
-									],
-									timestamp: Date.now(),
-								});
-							}
-							continue;
-						}
-						await recordSuccessfulFileMutation(targetPath);
+				if (hasMoreToolCalls) {
+					const planAllowed = new Set(["bash", "find", "grep", "ls", "read", "plan"]);
+					const disallowed = toolCalls.filter((tc) => !planAllowed.has(tc.name));
+					if (disallowed.length > 0) {
+						await emit({ type: "turn_end", message, toolResults: [] });
+						const blocked = disallowed.map((tc) => `\`${tc.name}\``).join(", ");
+						const allowList = [...planAllowed].map((n) => `\`${n}\``).join(", ");
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `Mode violation: ${blocked} is not allowed in PLAN mode. Allowed tools: ${allowList}.` }],
+							timestamp: Date.now(),
+						});
+						hasMoreToolCalls = false;
 						continue;
 					}
 
-					if (tc.name !== "edit") continue;
-					const targetPath = resolvedLoopPathForTool(tc);
-					if (!targetPath) continue;
-					if (tr.isError) {
-						const count = (editFailMap.get(targetPath) ?? 0) + 1;
-						editFailMap.set(targetPath, count);
-						const anchorText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
-						const errText = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-						const prevAnchor = priorFailedAnchor.get(targetPath);
-						const notFoundErr = errText.includes("Could not find");
-						const notFoundStreak = notFoundErr ? (editNotFoundStreakMap.get(targetPath) ?? 0) + 1 : 0;
-						editNotFoundStreakMap.set(targetPath, notFoundStreak);
-						if (pendingMessages.length === 0) {
-							try {
-								const resolvedPath = resolveWorkspaceToolPathString(targetPath, { basenameFallback: true });
-								const { abs, ok } = safeResolvePathUnderCwd(resolvedPath);
-								if (ok && existsSync(abs)) {
-									const fileContent = readFileSync(abs, "utf8");
+					const toolSignature = toolCalls.map((tc: any) => {
+						if (!tc || tc.type !== "toolCall") return "invalid";
+						const args = tc.arguments as Record<string, unknown> | undefined;
+						const p = typeof args?.path === "string" ? args.path : "";
+						const fp = typeof args?.file_path === "string" ? args.file_path : "";
+						return `${tc.name}:${p || fp}`;
+					}).join("|");
+					if (toolSignature.length > 0) {
+						if (toolSignature === lastToolSignature) repeatedToolSignatureCount++;
+						else {
+							lastToolSignature = toolSignature;
+							repeatedToolSignatureCount = 1;
+							lastSignatureMutationCount = successfulMutationCount;
+						}
+					}
+
+					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
+					for (const result of toolResults) {
+						currentContext.messages.push(result);
+						newMessages.push(result);
+					}
+
+					for (let bi = 0; bi < toolResults.length; bi++) {
+						const tr = toolResults[bi];
+						const tc = toolCalls[bi];
+						if (tr.toolName === "bash" && !tr.isError) {
+							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
+							if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
+								pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. Network installs and requests will fail. Proceed with `read`, `edit`, and `write` only - avoid `npm install` unless unavoidable." }], timestamp: Date.now() });
+								break;
+							}
+							const cmd =
+								tc && tc.type === "toolCall" && tc.name === "bash"
+									? String((tc.arguments as { command?: string })?.command ?? "")
+									: "";
+							const haystack = `${cmd}\n${output}`;
+							if (/\bnpm\s+(?:i|install|ci)\b/i.test(haystack) || /\bpnpm\s+(?:i|install|add)\b/i.test(haystack) || /\byarn\s+(?:add|install)\b/i.test(haystack)) {
+								pendingMessages.push({
+									role: "user",
+									content: [{ type: "text", text: "Package installs are slow and often blocked offline. Prefer `edit`/`write` using the repo's existing stack; skip new installs unless the task explicitly names a dependency." }],
+									timestamp: Date.now(),
+								});
+								break;
+							}
+						}
+						if ((tr.toolName === "find" || tr.toolName === "grep") && tr.isError) {
+							const errText = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
+							if (errText.includes("fd is not available") || errText.includes("ripgrep") || errText.includes("not available")) {
+								const tcFind = toolCalls.find((c: any) => c.type === "toolCall" && c.name === tr.toolName);
+								if (tcFind) {
+									const args = tcFind.arguments as any;
+									let bashCmd = "";
+									if (tr.toolName === "find") {
+										const pattern = args?.pattern || args?.glob || "*";
+										const dir = args?.path || ".";
+										bashCmd = `find ${dir} -type f -name "${pattern}" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" | head -30`;
+									} else {
+										const pattern = args?.pattern || "";
+										const searchPath = args?.path || ".";
+										const glob = args?.glob ? `--include="${args.glob}"` : "";
+										bashCmd = `grep -rnl ${glob} --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist "${pattern}" ${searchPath} | head -20`;
+									}
 									pendingMessages.push({
 										role: "user",
-										content: [{
-											type: "text",
-											text: `Edit failed on \`${targetPath}\`.\n\nUse this CURRENT FULL file content to build an exact \`oldText\` anchor, then retry \`edit\`.\n\n\`\`\`\n${escapeMarkdownFences(fileContent)}\n\`\`\``,
-										}],
+										content: [{ type: "text", text: `The ${tr.toolName} tool is unavailable. Use bash instead:\n\`\`\`\n${bashCmd}\n\`\`\`\nRun this with \`bash\` now.` }],
 										timestamp: Date.now(),
 									});
 								}
-							} catch {
-								// fall back to existing recovery nudges below
 							}
 						}
+					}
 
-						if (errText.includes("2 occurrences") || errText.includes("3 occurrences")) {
-							highRiskEditFiles.add(targetPath);
-							if (pendingMessages.length === 0) {
-								pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit failed: oldText matches multiple locations in \`${targetPath}\`. Add more surrounding lines to your oldText to make it unique. Use \`read\` to see the exact context.` }], timestamp: Date.now() });
-							}
-						} else if (errText.includes("must have required property") || errText.includes("Validation failed")) {
-							if (pendingMessages.length === 0) {
-								pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit schema error on \`${targetPath}\`. The edit tool requires: { "path": "file", "edits": [{ "oldText": "exact match", "newText": "replacement" }] }. Re-read the file and try again with correct format.` }], timestamp: Date.now() });
-							}
-						} else if (
-							errText.includes("Could not find") &&
-							!pathsAlreadyRead.has(targetPath) &&
-							pendingMessages.length === 0 &&
-							!isGeminiModel(config)
-						) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit failed on \`${targetPath}\` — your oldText doesn't match the file. Call \`read\` on \`${targetPath}\` first, then copy the exact text you want to replace.` }], timestamp: Date.now() });
-						} else if (anchorText && prevAnchor === anchorText && pendingMessages.length === 0 && !isGeminiModel(config)) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Identical oldText failed twice on \`${targetPath}\`. Use \`read\` to get fresh contents before retrying.` }], timestamp: Date.now() });
-						}
-						if (
-							notFoundStreak >= EDIT_NOT_FOUND_STREAK_FORCE_COMPACT_ANCHOR &&
-							pendingMessages.length === 0
-						) {
-							highRiskEditFiles.add(targetPath);
-							pendingMessages.push({
-								role: "user",
-								content: [
-									{
-										type: "text",
-										text: `Consecutive not-found edit failures on \`${targetPath}\` (${notFoundStreak}x). FORCE COMPACT-ANCHOR MODE now: 1) call \`read\` on the same path, 2) choose ONE target change, 3) use a short unique \`oldText\` anchor of 3-8 lines copied verbatim, 4) submit a single \`edit\` with that anchor only. Do not use large pasted blocks or memory-based text.`,
-									},
-								],
-								timestamp: Date.now(),
-							});
-						}
-						priorFailedAnchor.set(targetPath, anchorText);
-						if (isGeminiModel(config)) {
-							pendingMessages.push({
-								role: "user",
-								content: [
-									{
-										type: "text",
-										text: buildGeminiEditFailureRecoveryMessage(targetPath, errText, tc, foundFiles),
-									},
-								],
-								timestamp: Date.now(),
-							});
-						}
-						if (count >= EDIT_FAIL_CEILING && !failNotified.has(targetPath)) {
-							failNotified.add(targetPath);
-							pendingMessages.push({
-								role: "user",
-								content: [
-									{
-										type: "text",
-										text: `Edit attempts on \`${targetPath}\` have failed ${count} times. Your cached view is stale. Options:\n\n1. Switch to another file only if an acceptance criterion is still unmet there.\n2. Call \`read\` on this file to refresh, then use a compact oldText anchor (under 5 lines).\n3. Only use text you have just read — never paste from memory.`,
-									},
-								],
-								timestamp: Date.now(),
-							});
-						}
-					} else {
-						await recordSuccessfulFileMutation(targetPath);
-					}
-				}
-
-				for (let bi = 0; bi < toolResults.length; bi++) {
-					const tr = toolResults[bi];
-					const tc = toolCalls[bi];
-					if (tr.toolName === "bash" && !tr.isError) {
-						const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-						if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. Network installs and requests will fail. Proceed with \`read\`, \`edit\`, and \`write\` only — avoid \`npm install\` unless unavoidable." }], timestamp: Date.now() });
-							break;
-						}
-						const cmd =
-							tc && tc.type === "toolCall" && tc.name === "bash"
-								? String((tc.arguments as { command?: string })?.command ?? "")
-								: "";
-						const haystack = `${cmd}\n${output}`;
-						if (
-							/\bnpm\s+(?:i|install|ci)\b/i.test(haystack) ||
-							/\bpnpm\s+(?:i|install|add)\b/i.test(haystack) ||
-							/\byarn\s+(?:add|install)\b/i.test(haystack)
-						) {
-							pendingMessages.push({
-								role: "user",
-								content: [
-									{
-										type: "text",
-										text: "Package installs are slow and often blocked offline. Prefer \`edit\`/\`write\` using the repo's existing stack; skip new installs unless the task explicitly names a dependency.",
-									},
-								],
-								timestamp: Date.now(),
-							});
-							break;
-						}
-					}
-					if ((tr.toolName === "find" || tr.toolName === "grep") && tr.isError) {
-						const errText = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-						if (errText.includes("fd is not available") || errText.includes("ripgrep") || errText.includes("not available")) {
-							const tcFind = toolCalls.find((c: any) => c.type === "toolCall" && c.name === tr.toolName);
-							if (tcFind) {
-								const args = tcFind.arguments as any;
-								let bashCmd = "";
-								if (tr.toolName === "find") {
-									const pattern = args?.pattern || args?.glob || "*";
-									const dir = args?.path || ".";
-									bashCmd = `find ${dir} -type f -name "${pattern}" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" | head -30`;
-								} else {
-									const pattern = args?.pattern || "";
-									const searchPath = args?.path || ".";
-									const glob = args?.glob ? `--include="${args.glob}"` : "";
-									bashCmd = `grep -rnl ${glob} --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist "${pattern}" ${searchPath} | head -20`;
-								}
-								pendingMessages.push({
-									role: "user",
-									content: [{ type: "text", text: `The ${tr.toolName} tool is unavailable. Use bash instead:\n\`\`\`\n${bashCmd}\n\`\`\`\nRun this with \`bash\` now.` }],
-									timestamp: Date.now(),
-								});
-							}
-						}
-					}
-				}
-
-				const noProgressSinceSignature = successfulMutationCount === lastSignatureMutationCount;
-				if (
-					hasProducedEdit &&
-					repeatedToolSignatureCount >= REPEATED_TOOL_SIGNATURE_LIMIT &&
-					noProgressSinceSignature &&
-					planSubmitted &&
-					pendingMessages.length === 0
-				) {
-					const remainingPlanned = missingPlannedFiles();
-					if (executionMode === "implement" && remainingPlanned.length > 0) {
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `Repeated no-progress pattern detected. Do not stop: planned files still unedited: ${remainingPlanned.slice(0, 10).map((f) => `\`${f}\``).join(", ")}. Read next unedited planned file and implement it now.`,
-							}],
-							timestamp: Date.now(),
-						});
-					} else {
-						await emit({ type: "turn_end", message, toolResults });
-						await emit({ type: "agent_end", messages: newMessages });
-						return;
-					}
-				}
-				for (let i = 0; i < toolResults.length; i++) {
-					const tr = toolResults[i];
-					const tc = toolCalls[i];
-					if (!tc || tc.type !== "toolCall" || tc.name !== "plan") continue;
-					const planTimeoutExceeded = executionMode === "plan" && (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
-					if (tr.isError) {
-						const errText = tr.content?.map((c: any) => c?.text ?? "").join("") ?? "unknown plan validation error";
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: planTimeoutExceeded
-									? `PLAN timeout reached, but submitted plan is still invalid: ${errText}. Re-submit \`plan\` immediately with corrected paths/structure. Keep it concise but valid.`
-									: `Plan submission failed: ${errText}. Fix and call \`plan\` again.`,
-							}],
-							timestamp: Date.now(),
-						});
-						continue;
-					}
-					const planDetails = (tr as any)?.details as {
-						allPassed?: boolean;
-						criteriaAllCovered?: boolean;
-						uncoveredCriteria?: string[];
-						validationResults?: unknown[];
-					} | undefined;
-					if (!planDetails?.allPassed) {
-						const preview = Array.isArray(planDetails?.validationResults)
-							? planDetails!.validationResults
-								.map((v: any, idx: number) => {
-									const p = typeof v?.path === "string" ? v.path : "(missing path)";
-									const status = typeof v?.validation_result === "string" ? v.validation_result : "unknown";
-									const sug = Array.isArray(v?.suggested_paths) && v.suggested_paths.length > 0
-										? ` suggestions: ${v.suggested_paths.slice(0, 5).join(", ")}`
-										: "";
-									return `#${idx + 1} ${p} => ${status}${sug}`;
-								})
-								.join("; ")
-							: "Plan validation failed.";
-						const failedPaths = Array.isArray(planDetails?.validationResults)
-							? planDetails!.validationResults
-								.filter((v: any) => String(v?.validation_result ?? "") !== "passed")
-								.map((v: any) => (typeof v?.path === "string" ? v.path : ""))
-								.filter((p: string) => p.length > 0)
-							: [];
-						const failedPathNudge = failedPaths.length > 0
-							? `Failed planned file paths to verify/fix now: ${failedPaths.slice(0, 10).map((p: string) => `\`${p}\``).join(", ")}.`
-							: "";
-						const uncovered = Array.isArray(planDetails?.uncoveredCriteria) && planDetails!.uncoveredCriteria.length > 0
-							? `Uncovered task criteria: ${planDetails!.uncoveredCriteria.slice(0, 6).map((c: string) => `"${c}"`).join(" | ")}.`
-							: "";
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `Plan validation failed. Stay in PLAN mode. ${failedPathNudge} ${uncovered} Fix invalid path verification and criteria coverage, then call \`plan\` again. ${preview}`,
-							}],
-							timestamp: Date.now(),
-						});
-						continue;
-					}
-					const plans = extractPlanItems(tc.arguments);
-					if (plans.length === 0 && !planTimeoutExceeded) {
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: "Plan submission was empty or malformed. Stay in PLAN mode and call `plan` with `{ \"plans\": [{ \"path\": \"...\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"is_new_file\": false }] }`. Plans must be detailed.",
-							}],
-							timestamp: Date.now(),
-						});
-						continue;
-					}
-					const submittedPlanPaths = new Set<string>(
-						plans
-							.map((p) => (typeof p?.path === "string" ? normalizePathForMatch(p.path.trim()) : ""))
-							.filter((p) => p.length > 0),
-					);
-					const submittedTaskCriteriaRaw = Array.isArray((tc.arguments as any)?.task_acceptance_criteria)
-						? ((tc.arguments as any).task_acceptance_criteria as unknown[])
-						: [];
-					const submittedTaskCriteria = submittedTaskCriteriaRaw
-						.map((c) => (typeof c === "string" ? c.trim() : ""))
-						.filter((c) => c.length > 0);
-					// Criteria coverage is validated by plan tool execution result (`planDetails.allPassed`).
-					// Only run fallback structural checks when tool details are unavailable.
-					if (!planDetails) {
-						if (submittedTaskCriteria.length === 0) {
-							pendingMessages.push({
-								role: "user",
-								content: [{
-									type: "text",
-									text: "Plan payload must include non-empty `task_acceptance_criteria`. Stay in PLAN mode and resubmit `plan`.",
-								}],
-								timestamp: Date.now(),
-							});
-							continue;
-						}
-						const coveredByPlans = new Set<string>();
-						for (const p of plans) {
-							const refs = Array.isArray((p as any)?.acceptance_criteria) ? ((p as any).acceptance_criteria as unknown[]) : [];
-							for (const r of refs) {
-								if (typeof r === "string" && r.trim().length > 0) coveredByPlans.add(r.trim());
-							}
-						}
-						if (coveredByPlans.size !== submittedTaskCriteria.length) {
-							pendingMessages.push({
-								role: "user",
-								content: [{
-									type: "text",
-									text: `Plan coverage count mismatch: criteria covered by plan items is ${coveredByPlans.size}, but task_acceptance_criteria count is ${submittedTaskCriteria.length}. Add acceptance_criteria refs per plan item and resubmit \`plan\`.`,
-								}],
-								timestamp: Date.now(),
-							});
-							continue;
-						}
-					}
-					// PLAN gate 1: force discovery of expected files before PLAN->IMPLEMENT transition.
-					const undiscovered = undiscoveredExpectedFiles();
-					if (undiscovered.length > 0) {
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `Discover expected files first before transition. Call \`read\` (full file) on: ${undiscovered
-									.slice(0, 12)
-									.map((f) => `\`${f}\``)
-									.join(", ")}. Then resubmit \`plan\`.`,
-							}],
-							timestamp: Date.now(),
-						});
-						continue;
-					}
-					// PLAN gate 2 (hard): enforce required file coverage only (explicit named + criterion paths).
-					const missingRequiredInPlan = missingRequiredFromPlan(submittedPlanPaths);
-					if (missingRequiredInPlan.length > 0) {
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `Plan coverage incomplete in PLAN mode. Missing required files in \`plan\`: ${missingRequiredInPlan
-									.slice(0, 12)
-									.map((f) => `\`${f}\``)
-									.join(", ")}. Add them and call \`plan\` again before transition.`,
-							}],
-							timestamp: Date.now(),
-						});
-						continue;
-					}
-					// PLAN gate 2b (soft): broader expected-file misses become nudge, not hard block.
-					const missingExpectedInPlan = missingExpectedFromPlan(submittedPlanPaths);
-					if (missingExpectedInPlan.length > 0 && pendingMessages.length === 0) {
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `Advisory: some expected candidate files are not in \`plan\`: ${missingExpectedInPlan
-									.slice(0, 10)
-									.map((f) => `\`${f}\``)
-									.join(", ")}. Continue if criteria are fully covered; otherwise include required wiring.`,
-							}],
-							timestamp: Date.now(),
-						});
-					}
-					if (!planTimeoutExceeded) {
-						const strongExpected = new Set<string>();
-						for (const f of explicitNamedFiles) {
-							const nf = normalizePathForMatch(f);
-							if (nf.length > 0) strongExpected.add(nf);
-						}
-						for (const c of acceptanceCriteria) {
-							for (const f of c.requiredFiles) {
-								const nf = normalizePathForMatch(f);
-								if (nf.length > 0) strongExpected.add(nf);
-							}
-						}
-						// General anti-underplanning guard: for manageable expected-file sets, require full coverage of existing files.
-						const expectedExisting = expectedFiles
-							.map((f) => normalizePathForMatch(f))
-							.filter((f) => {
-								if (!f) return false;
-								const { abs, ok } = safeResolvePathUnderCwd(f);
-								return ok && existsSync(abs);
-							});
-						if (expectedExisting.length > 0 && expectedExisting.length <= 12) {
-							for (const f of expectedExisting) strongExpected.add(f);
-						}
-						const missingStrong = [...strongExpected].filter((f) => !submittedPlanPaths.has(f));
-						if (missingStrong.length > 0) {
-							pendingMessages.push({
-								role: "user",
-								content: [{
-									type: "text",
-									text: `Plan coverage incomplete. Stay in PLAN mode and call \`plan\` again. Missing required/expected files: ${missingStrong
-										.slice(0, 12)
-										.map((f) => `\`${f}\``)
-										.join(", ")}.`,
-								}],
-								timestamp: Date.now(),
-							});
-							continue;
-						}
-					}
-					if (plans.length > 0) {
-						const fullPlanPayload = {
-							task_acceptance_criteria: Array.isArray((tc.arguments as any)?.task_acceptance_criteria)
-								? (tc.arguments as any).task_acceptance_criteria
-								: [],
-							plans: plans.map((p) => ({
-								path: typeof p?.path === "string" ? p.path.trim() : "",
-								plan: typeof p?.plan === "string" ? p.plan.trim() : "",
-								acceptance_criteria: Array.isArray((p as any)?.acceptance_criteria)
-									? (p as any).acceptance_criteria
-									: [],
-								is_new_file: Boolean((p as any)?.is_new_file),
-							})),
-						};
-						console.log(`[plan] submitted payload\n${JSON.stringify(fullPlanPayload, null, 2)}`);
-					}
-					for (const p of plans) {
-						if (typeof p?.path === "string" && p.path.trim().length > 0) {
-							const np = normalizePathForMatch(p.path.trim());
-							plannedFiles.add(np);
-							if (typeof p?.plan === "string" && p.plan.trim().length > 0) {
-								planByFile.set(np, p.plan.trim());
-							}
-							if (!foundFiles.includes(np)) {
-								foundFiles.push(np);
-							}
-						}
-					}
-					await emitRolloutMarker("plan_submitted", {
-						plan_count: plans.length,
-						paths: plans
-							.map((p) => (typeof p?.path === "string" ? normalizePathForMatch(p.path.trim()) : ""))
-							.filter((p) => p.length > 0),
-					});
-					planSubmitted = true;
-					executionMode = "implement";
-					implementModeStartedAt = Date.now();
-					await emitRolloutMarker("mode_transition", { from: "plan", to: "implement", reason: "plan_submitted" });
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: `Switched to IMPLEMENT mode. Implement all planned files with minimal, style-matched edits. Planned files: ${[...plannedFiles].slice(0, 100).map((p) => `\`${p}\``).join(", ")}. Call \`read\` first (full file) before \`edit\`/\`write\` on that file.`,
-							},
-						],
-						timestamp: Date.now(),
-					});
-				}
-
-				for (let bi = 0; bi < toolResults.length; bi++) {
-					const tr = toolResults[bi];
-					if (tr.toolName === "bash" && !tr.isError) {
-						if (isStrictImplementMode()) continue;
-						const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-						const paths = output
-							.split("\n")
-							.filter((l: string) => l.trim().match(/\.\w+$/))
-							.map((l: string) => l.trim());
-						if (paths.length > 0) {
-							const merged = new Set<string>([...foundFiles, ...paths.slice(0, 20)]);
-							foundFiles = [...merged];
-							if (pendingMessages.length === 0) {
-								pendingMessages.push({
-									role: "user",
-									content: [
-										{
-											type: "text",
-											text: `Located ${paths.length} candidate files. Read each file you intend to modify before editing.`,
-										},
-									],
-									timestamp: Date.now(),
-								});
-							}
-						}
-					}
-					if (tr.toolName === "read" && !tr.isError) {
-						const tc2 = toolCalls[bi];
-						if (tc2 && tc2.type === "toolCall" && tc2.name === "read") {
-							const path = resolvedLoopPathForTool(tc2) ?? "";
-							if (path) absorbedFiles.add(path);
-						}
-					}
-				}
-				const absorbLimit = Math.min(Math.max(3, foundFiles.length > 10 ? 6 : 3), 8);
-				if (
-					executionMode === "implement" &&
-					absorbedFiles.size >= absorbLimit &&
-					!hasProducedEdit &&
-					pendingMessages.length === 0
-				) {
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: `${absorbedFiles.size} files read. Begin implementing now with \`edit\`/\`write\` (minimal, style-matched).`,
-							},
-						],
-						timestamp: Date.now(),
-					});
-				}
-
-				for (let i = 0; i < toolResults.length; i++) {
-					const tr = toolResults[i];
-					const tc = toolCalls[i];
-					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError && !isStrictImplementMode()) {
-						if (!hasProducedEdit) {
+					for (let i = 0; i < toolResults.length; i++) {
+						const tr = toolResults[i];
+						const tc = toolCalls[i];
+						if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError && !hasProducedEdit) {
 							explorationCount++;
 							totalExplorationSteps++;
 						}
-					}
-					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
-						const readPath = resolvedLoopPathForTool(tc);
-						if (readPath) {
+						if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall" && tc.name === "read") {
+							const path = resolvedLoopPathForTool(tc) ?? "";
+							if (path) absorbedFiles.add(path);
 							const rArgs = tc.arguments as { offset?: number; limit?: number } | undefined;
 							const isFullRead = typeof rArgs?.offset === "undefined" && typeof rArgs?.limit === "undefined";
-							if (isFullRead) {
-								addReadPathVariants(pathsAlreadyRead, readPath);
-								maybeAddBreadthHintAfterRead(readPath);
-								await maybeAddSiblingHintAfterRead(readPath);
+							if (isFullRead && path) {
+								addReadPathVariants(pathsAlreadyRead, path);
+								maybeAddBreadthHintAfterRead(path);
+								await maybeAddSiblingHintAfterRead(path);
+								pathReadCounts.set(path, (pathReadCounts.get(path) ?? 0) + 1);
 							}
-							pathReadCounts.set(readPath, (pathReadCounts.get(readPath) ?? 0) + 1);
 						}
 					}
-				}
-				const now = Date.now();
-				if (!isStrictImplementMode() && now - lastRereadNudgeAt >= 5_000 && pendingMessages.length === 0) {
-					for (const [rp, cnt] of pathReadCounts) {
-						if (cnt >= 3) {
+					for (let i = 0; i < toolResults.length; i++) {
+						const tr = toolResults[i];
+						const tc = toolCalls[i];
+						if (!tc || tc.type !== "toolCall" || tc.name !== "plan") continue;
+						const planTimeoutExceeded = (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
+						if (tr.isError) {
+							const errText = tr.content?.map((c: any) => c?.text ?? "").join("") ?? "unknown plan validation error";
+							pendingMessages.push({
+								role: "user",
+								content: [{ type: "text", text: planTimeoutExceeded ? `PLAN timeout reached, but submitted plan is still invalid: ${errText}. Re-submit \`plan\` immediately with corrected paths/structure. Keep it concise but valid.` : `Plan submission failed: ${errText}. Fix and call \`plan\` again.` }],
+								timestamp: Date.now(),
+							});
+							continue;
+						}
+						const planDetails = (tr as any)?.details as {
+							allPassed?: boolean;
+							uncoveredCriteria?: string[];
+							validationResults?: unknown[];
+						} | undefined;
+						if (!planDetails?.allPassed) {
+							const preview = Array.isArray(planDetails?.validationResults)
+								? planDetails!.validationResults.map((v: any, idx: number) => {
+									const p = typeof v?.path === "string" ? v.path : "(missing path)";
+									const status = typeof v?.validation_result === "string" ? v.validation_result : "unknown";
+									const sug = Array.isArray(v?.suggested_paths) && v.suggested_paths.length > 0 ? ` suggestions: ${v.suggested_paths.slice(0, 5).join(", ")}` : "";
+									return `#${idx + 1} ${p} => ${status}${sug}`;
+								}).join("; ")
+								: "Plan validation failed.";
+							const failedPaths = Array.isArray(planDetails?.validationResults)
+								? planDetails!.validationResults.filter((v: any) => String(v?.validation_result ?? "") !== "passed").map((v: any) => (typeof v?.path === "string" ? v.path : "")).filter((p: string) => p.length > 0)
+								: [];
+							const failedPathNudge = failedPaths.length > 0 ? `Failed planned file paths to verify/fix now: ${failedPaths.slice(0, 10).map((p: string) => `\`${p}\``).join(", ")}.` : "";
+							const uncovered = Array.isArray(planDetails?.uncoveredCriteria) && planDetails!.uncoveredCriteria.length > 0
+								? `Uncovered task criteria: ${planDetails!.uncoveredCriteria.slice(0, 6).map((c: string) => `"${c}"`).join(" | ")}.`
+								: "";
+							pendingMessages.push({
+								role: "user",
+								content: [{ type: "text", text: `Plan validation failed. Stay in PLAN mode. ${failedPathNudge} ${uncovered} Fix invalid path verification and criteria coverage, then call \`plan\` again. ${preview}` }],
+								timestamp: Date.now(),
+							});
+							continue;
+						}
+						const plans = extractPlanItems(tc.arguments);
+						if (plans.length === 0 && !planTimeoutExceeded) {
+							pendingMessages.push({
+								role: "user",
+								content: [{ type: "text", text: "Plan submission was empty or malformed. Stay in PLAN mode and call `plan` with `{ \"plans\": [{ \"path\": \"...\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"is_new_file\": false }] }`. Plans must be detailed." }],
+								timestamp: Date.now(),
+							});
+							continue;
+						}
+						const submittedPlanPaths = new Set<string>(plans.map((p) => (typeof p?.path === "string" ? normalizePathForMatch(p.path.trim()) : "")).filter((p) => p.length > 0));
+						const missingRequiredInPlan = missingRequiredFromPlan(submittedPlanPaths);
+						if (missingRequiredInPlan.length > 0) {
+							pendingMessages.push({
+								role: "user",
+								content: [{ type: "text", text: `Plan coverage incomplete in PLAN mode. Missing required files in \`plan\`: ${missingRequiredInPlan.slice(0, 12).map((f) => `\`${f}\``).join(", ")}. Add them and call \`plan\` again before transition.` }],
+								timestamp: Date.now(),
+							});
+							continue;
+						}
+						for (const p of plans) {
+							if (typeof p?.path !== "string" || p.path.trim().length === 0) continue;
+							const np = normalizePathForMatch(p.path.trim());
+							plannedFiles.add(np);
+							if (typeof p?.plan === "string" && p.plan.trim().length > 0) planByFile.set(np, p.plan.trim());
+							if (!foundFiles.includes(np)) foundFiles.push(np);
+						}
+						await emitRolloutMarker("plan_submitted", {
+							plan_count: plans.length,
+							paths: plans.map((p) => (typeof p?.path === "string" ? normalizePathForMatch(p.path.trim()) : "")).filter((p) => p.length > 0),
+						});
+						planSubmitted = true;
+						executionMode = "implement";
+						implementModeStartedAt = Date.now();
+						confirmPhaseStarted = false;
+						confirmPhaseDone = false;
+						confirmCurrentPath = null;
+						confirmPlanList.clear();
+						await emitRolloutMarker("mode_transition", { from: "plan", to: "implement", reason: "plan_submitted" });
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `Switched to IMPLEMENT mode. Implement all planned files with minimal, style-matched edits. Planned files: ${[...plannedFiles].slice(0, 100).map((p) => `\`${p}\``).join(", ")}. Call \`read\` first (full file) before \`edit\`/\`write\` on that file.` }],
+							timestamp: Date.now(),
+						});
+					}
+
+					const now = Date.now();
+					if (now - lastRereadNudgeAt >= 5_000 && pendingMessages.length === 0) {
+						for (const [rp, cnt] of pathReadCounts) {
+							if (cnt < 3) continue;
 							lastRereadNudgeAt = now;
 							const normRp = rp.replace(/^\.\//, "");
 							const others = foundFiles.filter((f: string) => {
@@ -2180,72 +1736,247 @@ async function runLoop(
 							});
 							pendingMessages.push({
 								role: "user",
-								content: [
-									{
-										type: "text",
-										text: `You have read \`${rp}\` ${cnt} times — stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` or \`write\` on a different file or stop."}`,
-									},
-								],
+								content: [{ type: "text", text: `You have read \`${rp}\` ${cnt} times - stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` or \`write\` on a different file or stop."}` }],
 								timestamp: Date.now(),
 							});
 							break;
 						}
 					}
-				}
-
-				const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 6));
-				if (!isStrictImplementMode() && !hasProducedEdit && explorationCount >= dynamicExploreCeiling && pendingMessages.length === 0) {
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: `Context gathered (${explorationCount} reads/bashes). Apply your first file change (\`edit\` or \`write\`) to the highest-priority target now. A partial patch always outscores an empty diff.`,
-							},
-						],
-						timestamp: Date.now(),
-					});
-					explorationCount = 0;
-				}
-
-				if (executionMode === "plan" && !hasProducedEdit && pendingMessages.length === 0) {
-					const elapsed = Date.now() - loopStart;
-					const readList = pathsAlreadyRead.size > 0
-						? `Previously read: ${[...pathsAlreadyRead].slice(0, 5).join(", ")}. `
-						: "";
-					if (!earlyNudgeSent && elapsed >= EARLY_NUDGE_MS) {
-						earlyNudgeSent = true;
+					const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 6));
+					if (!hasProducedEdit && explorationCount >= dynamicExploreCeiling && pendingMessages.length === 0) {
 						pendingMessages.push({
 							role: "user",
-							content: [
-								{
-									type: "text",
-									text: `${Math.round(elapsed/1000)}s elapsed without making plans. You exceeded your time budget. Make plans quickly and call plan tool.`,
-								},
-							],
+							content: [{ type: "text", text: `Context gathered (${explorationCount} reads/bashes). Apply your first file change (\`edit\` or \`write\`) to the highest-priority target now. A partial patch always outscores an empty diff.` }],
 							timestamp: Date.now(),
 						});
-					} else if (earlyNudgeSent && elapsed >= URGENT_NUDGE_MS && !urgentNudgeSent) {
-						urgentNudgeSent = true;
-						pendingMessages.push({
-							role: "user",
-							content: [
-								{
-									type: "text",
-									text: `${Math.round(elapsed/1000)}s elapsed without making plans. You exceeded your time budget. Make plans quickly and call plan tool.`,
-								},
-							],
-							timestamp: Date.now(),
-						});
+						explorationCount = 0;
 					}
 				}
-
-
-				if ((Date.now() - loopStart) >= ABSOLUTE_SESSION_CAP_MS) {
-					await emit({ type: "turn_end", message, toolResults });
-					await emit({ type: "agent_end", messages: newMessages });
-					return;
+			} else if (executionMode === "implement") {
+				if (confirmPhaseStarted && confirmCurrentPath) {
+					const assistantText = message.content
+						.filter((c: any) => c?.type === "text" && typeof c?.text === "string")
+						.map((c: any) => c.text)
+						.join("\n");
+					const hasPerfect = /\bPERFECT\b/.test(assistantText);
+					const hasImperfect = /\bIMPERFECT\b/.test(assistantText);
+					const hasFixCall = toolCalls.some((tc) => tc.name === "edit" || tc.name === "write");
+					if (hasPerfect && !hasFixCall) {
+						confirmPlanList.delete(confirmCurrentPath);
+						confirmCurrentPath = null;
+						await emit({ type: "turn_end", message, toolResults: [] });
+						if (!queueNextConfirmPrompt()) {
+							pendingMessages.push({
+								role: "user",
+								content: [{ type: "text", text: "All planned files confirmed PERFECT." }],
+								timestamp: Date.now(),
+							});
+						}
+						hasMoreToolCalls = false;
+						continue;
+					}
+					if (hasImperfect && !hasFixCall) {
+						await emit({ type: "turn_end", message, toolResults: [] });
+						pendingMessages.push({
+							role: "user",
+							content: [{
+								type: "text",
+								text: `CONFIRMPLAN for \`${confirmCurrentPath}\`: you returned IMPERFECT without a fix tool call. Submit \`edit\` or \`write\` for this file now.`,
+							}],
+							timestamp: Date.now(),
+						});
+						hasMoreToolCalls = false;
+						continue;
+					}
+					if (hasFixCall) {
+						const badTarget = toolCalls.some((tc) => {
+							if (tc.name !== "edit" && tc.name !== "write") return false;
+							const p = resolvedLoopPathForTool(tc);
+							if (!p) return false;
+							const np = normalizePathForMatch(p);
+							const nc = normalizePathForMatch(confirmCurrentPath!);
+							return !(np === nc || np.endsWith("/" + nc) || nc.endsWith("/" + np));
+						});
+						if (badTarget) {
+							await emit({ type: "turn_end", message, toolResults: [] });
+							pendingMessages.push({
+								role: "user",
+								content: [{
+									type: "text",
+									text: `CONFIRMPLAN fix calls must target only \`${confirmCurrentPath}\`. Retry with \`edit\`/\`write\` for that file.`,
+								}],
+								timestamp: Date.now(),
+							});
+							hasMoreToolCalls = false;
+							continue;
+						}
+					}
+					if (!hasMoreToolCalls && !hasPerfect && !hasImperfect) {
+						await emit({ type: "turn_end", message, toolResults: [] });
+						pendingMessages.push({
+							role: "user",
+							content: [{
+								type: "text",
+								text: `CONFIRMPLAN for \`${confirmCurrentPath}\`: reply with \`PERFECT\` or \`IMPERFECT\` (+ fix tool call).`,
+							}],
+							timestamp: Date.now(),
+						});
+						continue;
+					}
 				}
+				const isImplementReadOnlyTurn =
+					implementNeedsProgress &&
+					hasMoreToolCalls &&
+					toolCalls.every((tc) => tc.name === "read");
+				if (isImplementReadOnlyTurn) {
+					implementReadOnlyRequiredTurns++;
+				} else if (hasMoreToolCalls || !implementNeedsProgress) {
+					implementReadOnlyRequiredTurns = 0;
+				}
+				if (
+					isImplementReadOnlyTurn &&
+					implementReadOnlyRequiredTurns >= IMPLEMENT_READ_ONLY_REQUIRED_TURN_LIMIT &&
+					pendingMessages.length === 0
+				) {
+					const remainingPlanned = missingPlannedFiles();
+					const shallowPlanned = needsDeeperPlannedImplementation();
+					const nextTarget = remainingPlanned[0] ?? shallowPlanned[0] ?? [...plannedFiles][0] ?? "";
+					pendingMessages.push({
+						role: "user",
+						content: [{
+							type: "text",
+							text: `Implement-mode anti-stall: ${implementReadOnlyRequiredTurns} consecutive read-only turns while planned work remains. Stop read-only turns and apply \`edit\` or \`write\` now${nextTarget ? ` on \`${nextTarget}\`` : ""}.`,
+						}],
+						timestamp: Date.now(),
+					});
+				}
+				if (!hasMoreToolCalls) {
+					await emit({ type: "turn_end", message, toolResults: [] });
+					pendingMessages.push({
+						role: "user",
+						content: [{
+							type: "text",
+							text: "IMPLEMENT mode requires tool calls every turn. Call `read`, `edit`, or `write` now for planned files only.",
+						}],
+						timestamp: Date.now(),
+					});
+					continue;
+				}
+				if (hasMoreToolCalls) {
+					const implementAllowed = new Set(["read", "edit", "write"]);
+					const disallowed = toolCalls.filter((tc) => !implementAllowed.has(tc.name));
+					if (disallowed.length > 0) {
+						await emit({ type: "turn_end", message, toolResults: [] });
+						const blocked = disallowed.map((tc) => `\`${tc.name}\``).join(", ");
+						const allowList = [...implementAllowed].map((n) => `\`${n}\``).join(", ");
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `Mode violation: ${blocked} is not allowed in IMPLEMENT mode. Allowed tools: ${allowList}.` }],
+							timestamp: Date.now(),
+						});
+						hasMoreToolCalls = false;
+						continue;
+					}
+					for (const tc of toolCalls) {
+						if (!tc || tc.type !== "toolCall" || tc.name !== "edit") continue;
+						const tPath = resolvedLoopPathForTool(tc) ?? "";
+						const args = (tc.arguments as any) ?? {};
+						const edits = Array.isArray(args.edits) ? args.edits : [];
+						if (edits.length > 6) {
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit call on \`${tPath || "unknown file"}\` has ${edits.length} blocks. Split into smaller calls (max 6 blocks) to reduce mismatch and over-edit risk.` }], timestamp: Date.now() });
+							hasMoreToolCalls = false;
+							break;
+						}
+					}
+					if (!hasMoreToolCalls) {
+						await emit({ type: "turn_end", message, toolResults: [] });
+						continue;
+					}
+
+					const toolSignature = toolCalls.map((tc: any) => {
+						if (!tc || tc.type !== "toolCall") return "invalid";
+						const args = tc.arguments as Record<string, unknown> | undefined;
+						const p = typeof args?.path === "string" ? args.path : "";
+						const fp = typeof args?.file_path === "string" ? args.file_path : "";
+						return `${tc.name}:${p || fp}`;
+					}).join("|");
+					if (toolSignature.length > 0) {
+						if (toolSignature === lastToolSignature) repeatedToolSignatureCount++;
+						else {
+							lastToolSignature = toolSignature;
+							repeatedToolSignatureCount = 1;
+							lastSignatureMutationCount = successfulMutationCount;
+						}
+					}
+
+					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
+					for (const result of toolResults) {
+						currentContext.messages.push(result);
+						newMessages.push(result);
+					}
+
+					for (let i = 0; i < toolResults.length; i++) {
+						const tr = toolResults[i];
+						const tc = toolCalls[i];
+						if (!tc || tc.type !== "toolCall") continue;
+						if (tc.name === "write") {
+							const targetPath = resolvedLoopPathForTool(tc);
+							if (!targetPath) continue;
+							if (tr.isError) {
+								if (pendingMessages.length === 0) pendingMessages.push({ role: "user", content: [{ type: "text", text: `Write failed for \`${targetPath}\`. Check path and arguments; retry with \`write\` or switch to \`edit\` on an existing file.` }], timestamp: Date.now() });
+								continue;
+							}
+							await recordSuccessfulFileMutation(targetPath);
+							continue;
+						}
+						if (tc.name !== "edit") continue;
+						const targetPath = resolvedLoopPathForTool(tc);
+						if (!targetPath) continue;
+						if (tr.isError) {
+							const errText = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
+							if (pendingMessages.length === 0) pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit failed on \`${targetPath}\`. Call \`read\` on this file and retry with an exact oldText anchor.` }], timestamp: Date.now() });
+							if (isGeminiModel(config)) pendingMessages.push({ role: "user", content: [{ type: "text", text: buildGeminiEditFailureRecoveryMessage(targetPath, errText, tc, foundFiles) }], timestamp: Date.now() });
+						} else {
+							await recordSuccessfulFileMutation(targetPath);
+						}
+					}
+
+					for (let i = 0; i < toolResults.length; i++) {
+						const tr = toolResults[i];
+						const tc = toolCalls[i];
+						if (tr.toolName !== "read" || tr.isError || !tc || tc.type !== "toolCall") continue;
+						const readPath = resolvedLoopPathForTool(tc);
+						if (!readPath) continue;
+						const rArgs = tc.arguments as { offset?: number; limit?: number } | undefined;
+						const isFullRead = typeof rArgs?.offset === "undefined" && typeof rArgs?.limit === "undefined";
+						if (!isFullRead) continue;
+						addReadPathVariants(pathsAlreadyRead, readPath);
+						const normRead = normalizePathForMatch(readPath);
+						const planText = planByFile.get(normRead) ?? "";
+						if (pendingMessages.length === 0) {
+							pendingMessages.push({
+								role: "user",
+								content: [{ type: "text", text: `IMPLEMENT read loaded \`${readPath}\`. Next action must be \`edit\`/\`write\` for planned changes only.${planText ? `\n\nPlanned edits for this file:\n${planText}` : ""}\n\nMatch existing local style (naming, formatting, surrounding patterns) in this file.` }],
+								timestamp: Date.now(),
+							});
+						}
+					}
+					if (confirmPhaseStarted && confirmCurrentPath && hasMoreToolCalls && pendingMessages.length === 0) {
+						pendingMessages.push(buildConfirmPrompt(confirmCurrentPath));
+					}
+				}
+			}
+			const noProgressSinceSignature = successfulMutationCount === lastSignatureMutationCount;
+			if (
+				hasProducedEdit &&
+				repeatedToolSignatureCount >= REPEATED_TOOL_SIGNATURE_LIMIT &&
+				noProgressSinceSignature &&
+				planSubmitted &&
+				pendingMessages.length === 0
+			) {
+				await emit({ type: "turn_end", message, toolResults });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
@@ -2289,18 +2020,6 @@ async function runLoop(
 		}
 		// Hard stop gate: if explicit/named target files from criteria are still untouched, continue editing.
 		if (hasProducedEdit) {
-			const missing = missingExpectedFiles();
-			if (missing.length > 0) {
-				pendingMessages = [{
-					role: "user",
-					content: [{
-						type: "text",
-						text: `Do not stop. Explicitly named/criteria files remain unedited: ${missing.slice(0, 8).map((f) => `\`${f}\``).join(", ")}. Continue and land edits for unmet criteria.`,
-					}],
-					timestamp: Date.now(),
-				}];
-				continue;
-			}
 			const unsatisfied = unsatisfiedCriteria();
 			if (unsatisfied.length > 0) {
 				const preview = unsatisfied
@@ -2332,6 +2051,10 @@ async function runLoop(
 		if (executionMode === "implement" && !planSubmitted) {
 			await emitRolloutMarker("mode_transition", { from: "implement", to: "plan", reason: "invariant_correction" });
 			executionMode = "plan";
+			confirmPhaseStarted = false;
+			confirmPhaseDone = false;
+			confirmCurrentPath = null;
+			confirmPlanList.clear();
 			pendingMessages = [{
 				role: "user",
 				content: [{
@@ -2342,17 +2065,45 @@ async function runLoop(
 			}];
 			continue;
 		}
-		const missingFromPlan = missingPlannedFiles();
-		if (executionMode === "implement" && missingFromPlan.length > 0) {
-			pendingMessages = [{
-				role: "user",
-				content: [{
-					type: "text",
-					text: `Do not stop. Planned files still unedited: ${missingFromPlan.slice(0, 10).map((f) => `\`${f}\``).join(", ")}. Implement all planned files.`,
-				}],
-				timestamp: Date.now(),
-			}];
-			continue;
+		if (executionMode === "implement") {
+			const missingFromPlan = missingPlannedFiles();
+			if (missingFromPlan.length > 0) {
+				pendingMessages = [{
+					role: "user",
+					content: [{
+						type: "text",
+						text: `Do not stop. Planned files still unedited: ${missingFromPlan.slice(0, 10).map((f) => `\`${f}\``).join(", ")}. Implement all planned files.`,
+					}],
+					timestamp: Date.now(),
+				}];
+				continue;
+			}
+			const shallowPlanned = needsDeeperPlannedImplementation();
+			if (shallowPlanned.length > 0) {
+				pendingMessages = [{
+					role: "user",
+					content: [{
+						type: "text",
+						text: `Do not stop yet. These planned files have high-detail plans but too little implementation evidence: ${shallowPlanned
+							.slice(0, 8)
+							.map((f) => `\`${f}\``)
+							.join(", ")}. Continue implementing those plan details before stopping.`,
+					}],
+					timestamp: Date.now(),
+				}];
+				continue;
+			}
+			if (!confirmPhaseDone) {
+				if (!confirmPhaseStarted) {
+					confirmPhaseStarted = true;
+					for (const pf of plannedFiles) {
+						if (isPathEdited(pf)) confirmPlanList.add(normalizePathForMatch(pf));
+					}
+				}
+				if (confirmCurrentPath === null && queueNextConfirmPrompt()) {
+					continue;
+				}
+			}
 		}
 		// Review pass: if finished quickly and edits were made, check for missed files
 		const reviewElapsed = Date.now() - loopStart;
