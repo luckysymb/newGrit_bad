@@ -592,21 +592,13 @@ async function runLoop(
 
 	const editFailMap = new Map<string, number>();
 	const editNotFoundStreakMap = new Map<string, number>();
-	const failNotified = new Set<string>();
-	const EDIT_FAIL_CEILING = 2;
-	const EDIT_NOT_FOUND_STREAK_FORCE_COMPACT_ANCHOR = 2;
 	const priorFailedAnchor = new Map<string, string>();
 
 	let explorationCount = 0;
 	let totalExplorationSteps = 0;
 	let hasProducedEdit = false;
-	let emptyTurnRetries = 0;
-	const EMPTY_TURN_MAX = 2;
 
 	const loopStart = Date.now();
-	let earlyNudgeSent = false;
-	let urgentNudgeSent = false;
-	let finalNudgeSent = false;
 	let implementReadOnlyRequiredTurns = 0;
 	const pathsAlreadyRead = new Set<string>();
 	const pathReadCounts = new Map<string, number>();
@@ -647,7 +639,6 @@ async function runLoop(
 	};
 	let foundFiles: string[] = [];
 	let absorbedFiles = new Set<string>();
-	const highRiskEditFiles = new Set<string>();
 	const plannedFiles = new Set<string>();
 	const planByFile = new Map<string, string>();
 
@@ -786,10 +777,6 @@ async function runLoop(
 			/\b(socket|127\.0\.0\.1|localhost|http:\/\/|https:\/\/)\b/.test(cmd)
 		);
 	};
-	const allowedToolsForMode = (mode: "plan" | "implement"): Set<string> =>
-		mode === "plan"
-			? new Set(["bash", "find", "grep", "ls", "read", "plan"])
-			: new Set(["read", "edit", "write"]);
 	const emitRolloutMarker = async (name: string, payload: Record<string, unknown> = {}): Promise<void> => {
 		const marker = {
 			type: name,
@@ -929,8 +916,6 @@ async function runLoop(
 		}
 		return false;
 	};
-	const isStrictImplementMode = (): boolean => executionMode === "implement" && planSubmitted;
-	const editOldTextLineCount = (s: string): number => s.split(/\r?\n/).length;
 
 	// Extract expected files from system prompt or initial messages
 	const systemPromptText = (currentContext as any).systemPrompt || "";
@@ -1022,38 +1007,6 @@ async function runLoop(
 	if (expectedFiles.length > 0) {
 		foundFiles = [...expectedFiles];
 	}
-	const missingExpectedFiles = (): string[] => {
-		if (expectedFiles.length === 0) return [];
-		const missing: string[] = [];
-		for (const f of expectedFiles) {
-			const norm = f.replace(/^\.\//, "");
-			let touched = false;
-			for (const e of editedPaths) {
-				const en = e.replace(/^\.\//, "");
-				if (en === norm || en.endsWith("/" + norm) || norm.endsWith("/" + en)) { touched = true; break; }
-			}
-			if (!touched) missing.push(f);
-		}
-		return missing;
-	};
-	const missingExpectedFromPlan = (submittedPlanPaths: Set<string>): string[] => {
-		if (expectedFiles.length === 0) return [];
-		const missing: string[] = [];
-		for (const f of expectedFiles) {
-			const norm = normalizePathForMatch(f);
-			// Gate only path-specific expectations; basename-only hints are too ambiguous for hard blocking.
-			if (!norm.includes("/")) continue;
-			let covered = false;
-			for (const p of submittedPlanPaths) {
-				if (p === norm || p.endsWith("/" + norm) || norm.endsWith("/" + p)) {
-					covered = true;
-					break;
-				}
-			}
-			if (!covered) missing.push(f);
-		}
-		return missing;
-	};
 	const requiredPlanPathsForTransition = (): string[] => {
 		const required = new Set<string>();
 		for (const f of explicitNamedFiles) {
@@ -1100,8 +1053,6 @@ async function runLoop(
 		}
 		return missing;
 	};
-	const EARLY_NUDGE_MS = 60_000;
-	const URGENT_NUDGE_MS = 110_000;
 	const GRACEFUL_EXIT_MS = 170_000;
 	/** Hard cap below common evaluator timeout (~600s) so landed edits are emitted before external cutoff. */
 	const ABSOLUTE_SESSION_CAP_MS = 500_000;
@@ -1330,7 +1281,7 @@ async function runLoop(
 			role: "user",
 			content: [{
 				type: "text",
-				text: "PLAN search protocol (follow in order): 1) grep exact task terms/paths/symbols, 2) read top owner file(s), 3) sweep only required wiring neighbors (entrypoint/coordinator/utility/fallback/interface), 4) verify every acceptance criterion maps to file(s), 5) call `plan` immediately. Avoid broad unfocused exploration.",
+				text: "PLAN search protocol (follow in order): 1) grep exact task terms/paths/symbols, 2) read top owner file(s), 3) sweep only required wiring neighbors (entrypoint/coordinator/utility/fallback/interface), 4) verify every acceptance criterion maps to file(s), 5) call `plan` immediately with exact JSON format. Avoid broad unfocused exploration.",
 			}],
 			timestamp: Date.now(),
 		});
@@ -1472,7 +1423,7 @@ async function runLoop(
 						continue;
 					}
 				}
-				if (hasMoreToolCalls) {
+				{
 					const hasMutationAttempt = toolCalls.some((tc) => {
 						if (tc.name === "edit" || tc.name === "write") return true;
 						if (tc.name !== "bash") return false;
@@ -1488,7 +1439,7 @@ async function runLoop(
 						await emit({ type: "turn_end", message, toolResults: [] });
 						pendingMessages.push({
 							role: "user",
-							content: [{ type: "text", text: "Still in PLAN mode. File mutations are forbidden before plan submission (`edit`/`write` and mutating `bash` commands). Continue broad discovery and then call `plan` with JSON plans." }],
+							content: [{ type: "text", text: "Still in PLAN mode. File mutations are forbidden before plan submission (`edit`/`write` and mutating `bash` commands). Continue broad discovery and then call `plan` with exact JSON format." }],
 							timestamp: Date.now(),
 						});
 						hasMoreToolCalls = false;
@@ -1498,7 +1449,7 @@ async function runLoop(
 						await emit({ type: "turn_end", message, toolResults: [] });
 						pendingMessages.push({
 							role: "user",
-							content: [{ type: "text", text: "PLAN mode forbids network/probe bash commands (they often fail with ConnectionRefusedError in eval sandboxes). Use only local repository discovery tools and then call `plan`." }],
+							content: [{ type: "text", text: "PLAN mode forbids network/probe bash commands (they often fail with ConnectionRefusedError in eval sandboxes). Use only local repository discovery tools and then call `plan` with exact JSON format." }],
 							timestamp: Date.now(),
 						});
 						hasMoreToolCalls = false;
@@ -1522,14 +1473,14 @@ async function runLoop(
 						content: [
 							{
 								type: "text",
-								text: "You are still in PLAN mode. Your last turn had no effective planning progress. Follow right-search order now: grep exact task terms -> read owner file(s) -> sweep required wiring neighbors -> criterion-to-file coverage check -> call `plan`. Use JSON: { \"plans\": [{ \"path\": \"...\", \"plan\": \"...\", \"is_new_file\": false }, ...] }.",
+								text: "You are still in PLAN mode. Your last turn had no effective planning progress. Follow right-search order now: grep exact task terms -> read owner file(s) -> sweep required wiring neighbors -> criterion-to-file coverage check -> call `plan` with exact JSON format.",
 							},
 						],
 						timestamp: Date.now(),
 					});
 					continue;
 				}
-				if (hasMoreToolCalls) {
+				{
 					const planAllowed = new Set(["bash", "find", "grep", "ls", "read", "plan"]);
 					const disallowed = toolCalls.filter((tc) => !planAllowed.has(tc.name));
 					if (disallowed.length > 0) {
@@ -1683,7 +1634,7 @@ async function runLoop(
 						if (plans.length === 0 && !planTimeoutExceeded) {
 							pendingMessages.push({
 								role: "user",
-								content: [{ type: "text", text: "Plan submission was empty or malformed. Stay in PLAN mode and call `plan` with `{ \"plans\": [{ \"path\": \"...\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"is_new_file\": false }] }`. Plans must be detailed." }],
+								content: [{ type: "text", text: "Plan submission was empty or malformed. Stay in PLAN mode and call `plan` with exact JSON format. Plans must be detailed." }],
 								timestamp: Date.now(),
 							});
 							continue;
@@ -2047,25 +1998,24 @@ async function runLoop(
 				timestamp: Date.now(),
 			}];
 			continue;
-		}
-		if (executionMode === "implement" && !planSubmitted) {
-			await emitRolloutMarker("mode_transition", { from: "implement", to: "plan", reason: "invariant_correction" });
-			executionMode = "plan";
-			confirmPhaseStarted = false;
-			confirmPhaseDone = false;
-			confirmCurrentPath = null;
-			confirmPlanList.clear();
-			pendingMessages = [{
-				role: "user",
-				content: [{
-					type: "text",
-					text: "Invariant correction: implement mode requires successful `plan` tool call first. Return to PLAN mode, finish planning, and call `plan` tool.",
-				}],
-				timestamp: Date.now(),
-			}];
-			continue;
-		}
-		if (executionMode === "implement") {
+		} else if (executionMode === "implement") {
+			if (!planSubmitted) {
+				await emitRolloutMarker("mode_transition", { from: "implement", to: "plan", reason: "invariant_correction" });
+				executionMode = "plan";
+				confirmPhaseStarted = false;
+				confirmPhaseDone = false;
+				confirmCurrentPath = null;
+				confirmPlanList.clear();
+				pendingMessages = [{
+					role: "user",
+					content: [{
+						type: "text",
+						text: "Invariant correction: implement mode requires successful `plan` tool call first. Return to PLAN mode, finish planning, and call `plan` tool with exact JSON format.",
+					}],
+					timestamp: Date.now(),
+				}];
+				continue;
+			}
 			const missingFromPlan = missingPlannedFiles();
 			if (missingFromPlan.length > 0) {
 				pendingMessages = [{
@@ -2108,7 +2058,7 @@ async function runLoop(
 		// Review pass: if finished quickly and edits were made, check for missed files
 		const reviewElapsed = Date.now() - loopStart;
 		// Previously capped at 60s, which skipped the review nudge on slow models (exploration alone could exceed it).
-		if (!reviewPassDone && executionMode !== "implement" && hasProducedEdit && reviewElapsed < ABSOLUTE_SESSION_CAP_MS) {
+		if (!reviewPassDone && hasProducedEdit && reviewElapsed < ABSOLUTE_SESSION_CAP_MS) {
 			reviewPassDone = true;
 			const uneditedTargets = foundFiles.filter(
 				(f: string) => {
