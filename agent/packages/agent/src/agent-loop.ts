@@ -1066,33 +1066,6 @@ async function runLoop(
 	let lastSignatureMutationCount = 0;
 	const siblingHintedReadDirs = new Set<string>();
 	let implementModeStartedAt: number | null = null;
-	const recoverPlanStateFromMessages = (): boolean => {
-		// Recover planSubmitted/plannedFiles after compaction or context rebuild.
-		// We trust the latest successful plan tool result details first.
-		let recoveredPaths: string[] = [];
-		for (let i = currentContext.messages.length - 1; i >= 0; i--) {
-			const m: any = currentContext.messages[i];
-			if (!m || m.role !== "toolResult" || m.toolName !== "plan") continue;
-			if (m.isError) continue;
-			const details = m.details as { allPassed?: boolean; paths?: unknown[] } | undefined;
-			if (details?.allPassed && Array.isArray(details.paths) && details.paths.length > 0) {
-				recoveredPaths = details.paths
-					.map((p) => (typeof p === "string" ? normalizePathForMatch(p) : ""))
-					.filter((p) => p.length > 0);
-				break;
-			}
-		}
-		if (recoveredPaths.length === 0) return false;
-		for (const p of recoveredPaths) {
-			plannedFiles.add(p);
-			if (!foundFiles.includes(p)) foundFiles.push(p);
-		}
-		planSubmitted = true;
-		executionMode = "implement";
-		if (implementModeStartedAt === null) implementModeStartedAt = Date.now();
-		return true;
-	};
-
 	/** Successful `edit` or `write` mutates disk — both must advance scoring-related loop state (was edit-only). */
 	const recordSuccessfulFileMutation = async (targetPath: string): Promise<void> => {
 		editFailMap.set(targetPath, 0);
@@ -1286,12 +1259,6 @@ async function runLoop(
 			timestamp: Date.now(),
 		});
 	}
-	const recoveredIntoImplement = recoverPlanStateFromMessages();
-	if (recoveredIntoImplement) {
-		// PLAN-specific kickoff nudge is not relevant when recovered into IMPLEMENT mode.
-		pendingMessages = pendingMessages.filter((m) => !isPlanSteeringMessage(m));
-	}
-
 	while (true) {
 		let hasMoreToolCalls = true;
 
