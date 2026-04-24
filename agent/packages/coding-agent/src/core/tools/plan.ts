@@ -7,6 +7,11 @@ import type { ToolDefinition } from "../extensions/types.js";
 import { resolveToCwd, resolveWorkspacePath } from "./path-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
+const MIN_PLAN_CHARS = 260;
+const MIN_PLAN_LINES = 4;
+const REQUIRED_PLAN_SECTIONS = ["Scope", "Edits", "Acceptance", "Verification"] as const;
+/** Real tasks almost always touch under 10 files; cap keeps plans from fragmenting into dozens of micro-edits. */
+const MAX_PLAN_ITEMS = 9;
 const planItemSchema = Type.Object(
 	{
 		path: Type.String({ description: "File path to edit in implementation mode" }),
@@ -30,8 +35,10 @@ const planSchema = Type.Object(
 			minItems: 1,
 		}),
 		plans: Type.Array(planItemSchema, {
-			description: "Implementation plan items, each with target file, and detailed edit instructions and is_new_file flag.",
+			description:
+				`Implementation plan items (each: target file, detailed edit instructions, is_new_file). Must be fewer than 10 entries — at most ${MAX_PLAN_ITEMS} files. If you planned more than 10 files, it means your plans are wrong. You should think about your plans again. Search on sibling directories for related files.`,
 			minItems: 1,
+			maxItems: MAX_PLAN_ITEMS,
 		}),
 	},
 	{ additionalProperties: false },
@@ -54,9 +61,6 @@ type PlanValidationResult = {
 	suggested_paths?: string[];
 };
 
-const MIN_PLAN_CHARS = 260;
-const MIN_PLAN_LINES = 4;
-const REQUIRED_PLAN_SECTIONS = ["Scope", "Edits", "Acceptance", "Verification"] as const;
 
 export interface PlanToolDetails {
 	planCount: number;
@@ -135,11 +139,12 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 		name: "plan",
 		label: "plan",
 		description:
-			"Submit final PLAN->IMPLEMENT handoff JSON. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. `plans` must be non-empty; each item must include all keys.",
+			`Submit final PLAN->IMPLEMENT handoff JSON. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. \`plans\` must be non-empty and have fewer than 10 items (at most ${MAX_PLAN_ITEMS}); each item must include all keys.`,
 		promptSnippet:
 			"Call plan with exact JSON interface: { task_acceptance_criteria: [...], plans: [{ path, plan, acceptance_criteria, is_new_file }] }",
 		promptGuidelines: [
 			"Call plan only after broad and thorough exploration in plan mode",
+			`Submit fewer than 10 plan entries (at most ${MAX_PLAN_ITEMS} files). If you planned more than 10 files, it means your plans are wrong and you searched only a few files. Search more files on sibling directories for related files.`,
 			"Include every target file needed to satisfy all acceptance criteria",
 			"Use exact interface keys: task_acceptance_criteria, path, plan, acceptance_criteria, is_new_file (no aliases)",
 			"Each plan item must declare which acceptance criteria it covers via acceptance_criteria",
@@ -172,6 +177,11 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 				.filter((p: NormalizedPlanItem) => p.path.length > 0 && p.plan.length > 0);
 			if (normalized.length === 0) {
 				throw new Error("plan requires at least one valid { path, plan, is_new_file } item");
+			}
+			if (normalized.length > MAX_PLAN_ITEMS) {
+				throw new Error(
+					`plan must list fewer than 10 files: at most ${MAX_PLAN_ITEMS} plan items (got ${normalized.length}). You should think about your plans again. Search on sibling directories for related files.`,
+				);
 			}
 			ensureShellValidationToolsAvailable();
 			const autoNormalizedExistingPaths: string[] = [];

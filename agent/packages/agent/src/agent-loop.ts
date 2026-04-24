@@ -280,47 +280,54 @@ function escapeMarkdownFences(s: string): string {
 	return s.replace(/```/g, "\\`\\`\\`");
 }
 
-function fenceLangFromPath(filePath: string): string {
-	const ext = extname(filePath).slice(1).toLowerCase();
-	const m: Record<string, string> = {
-		ts: "typescript",
-		tsx: "tsx",
-		js: "javascript",
-		jsx: "javascript",
-		py: "python",
-		rs: "rust",
-		go: "go",
-		cs: "csharp",
-		json: "json",
-		html: "html",
-		css: "css",
-		md: "markdown",
-		sh: "bash",
-		yml: "yaml",
-		yaml: "yaml",
-	};
-	return m[ext] ?? (ext || "text");
-}
-
 const GEMINI_OLDTEXT_RECOVERY_MAX_CHARS = 500_000;
 
-/** Full `oldText` blocks for Gemini recovery (wrong-anchor debugging); cap avoids pathological payloads. */
-function extractOldTextForGeminiRecovery(toolCall: AgentToolCall): string {
-	const args = toolCall.arguments as { edits?: Array<{ oldText?: string }>; oldText?: string } | undefined;
+/**
+ * Summarize each edits[] entry as the model sent it, including its lineRange (if any)
+ * and its oldText. Used by the recovery message so the model can see exactly what it
+ * asked for versus what the file actually contains at those lines.
+ */
+function extractEditsForRecovery(toolCall: AgentToolCall): string {
+	const args = toolCall.arguments as
+		| {
+				edits?: Array<Record<string, unknown>>;
+				oldText?: unknown;
+				startLine?: unknown;
+				endLine?: unknown;
+				lineRange?: unknown;
+		  }
+		| undefined;
 	if (!args) return "";
 	const chunks: string[] = [];
+	const fmtRange = (r: Record<string, unknown> | undefined): string => {
+		if (!r) return "(missing or invalid)";
+		const pairs: Array<[unknown, unknown]> = [
+			[r.startLine, r.endLine],
+			[r.start_line, r.end_line],
+			[r.firstLine, r.lastLine],
+			[r.first_line, r.last_line],
+		];
+		for (const [a, b] of pairs) {
+			if (typeof a === "number" && typeof b === "number") return `[${a}, ${b}]`;
+		}
+		const t = r.lineRange;
+		if (Array.isArray(t) && t.length === 2 && typeof t[0] === "number" && typeof t[1] === "number") {
+			return `[${t[0]}, ${t[1]}]`;
+		}
+		return "(missing or invalid)";
+	};
 	if (typeof args.oldText === "string" && args.oldText.length > 0) {
-		chunks.push(args.oldText);
+		chunks.push(`range=${fmtRange(args as Record<string, unknown>)}\noldText:\n${args.oldText}`);
 	}
 	if (Array.isArray(args.edits)) {
 		for (let i = 0; i < args.edits.length; i++) {
-			const ot = args.edits[i]?.oldText;
-			if (typeof ot === "string" && ot.length > 0) {
-				chunks.push(args.edits!.length > 1 ? `--- edits[${i}].oldText ---\n${ot}` : ot);
-			}
+			const e = args.edits[i] ?? {};
+			const ot = typeof e?.oldText === "string" ? (e.oldText as string) : "";
+			const range = fmtRange(e as Record<string, unknown>);
+			chunks.push(`edits[${i}]: range=${range}\noldText:\n${ot}`);
 		}
 	}
-	let s = chunks.join("\n\n");
+	let s = chunks.join("\n---\n");
 	if (s.length > GEMINI_OLDTEXT_RECOVERY_MAX_CHARS) {
 		s = `${s.slice(0, GEMINI_OLDTEXT_RECOVERY_MAX_CHARS)}…`;
 	}
@@ -328,110 +335,19 @@ function extractOldTextForGeminiRecovery(toolCall: AgentToolCall): string {
 }
 
 /**
- * Rich recovery text for Gemini after a failed `edit`: actual file bytes (when present) or
- * concrete discovery commands when the path is wrong/missing.
+ * Prepend 0-indexed line numbers to the file content (right-padded to 6 chars).
+ * Matches the indexing convention of the line-range edit tool so the model can
+ * pick `lineRange: [first, last]` directly off the shown numbering.
  */
-function buildGeminiEditFailureRecoveryMessage(
-	targetPath: string,
-	errText: string,
-	toolCall: AgentToolCall,
-	foundFiles: string[],
-): string {
-	const pathForDisk = resolveWorkspaceToolPathString(targetPath, { basenameFallback: true });
-	const { abs, ok } = safeResolvePathUnderCwd(pathForDisk);
-	const base = basename(pathForDisk);
-	const lines: string[] = [];
-
-	lines.push(`## Edit failed for \`${targetPath}\`${pathForDisk !== targetPath ? ` (resolved to \`${pathForDisk}\`)` : ""}`);
-	lines.push("");
-	lines.push("**Tool error (verbatim):**");
-	lines.push("```text");
-	lines.push(escapeMarkdownFences(errText.trim() || "(empty error message)"));
-	lines.push("```");
-	lines.push("");
-
-	const oldTextDump = extractOldTextForGeminiRecovery(toolCall);
-	if (oldTextDump) {
-		lines.push("**Your `oldText` from the failed tool call — compare byte-for-byte with the file contents below:**");
-		lines.push("```text");
-		lines.push(escapeMarkdownFences(oldTextDump));
-		lines.push("```");
-		lines.push("");
+function formatFileWithZeroIndexedLines(content: string): string {
+	const lines = content.split("\n");
+	const pad = Math.max(3, String(Math.max(0, lines.length - 1)).length);
+	const out: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const n = String(i).padStart(pad, " ");
+		out.push(`${n}| ${lines[i]}`);
 	}
-
-	if (!ok) {
-		lines.push(`**Path safety:** resolved path would leave the workspace cwd (\`${process.cwd()}\`) — fix \`..\` or use a repo-relative path.`);
-		lines.push("");
-		lines.push(`**Discover a safe path:** use \`find\` / \`grep\` from the repo root (see examples below).`);
-		lines.push("");
-		lines.push(`**Example bash:**`);
-		lines.push(`\`\`\`bash`);
-		lines.push(`find . -type f -name '*${base}*' -not -path '*/node_modules/*' -not -path '*/.git/*' | head -20`);
-		lines.push(`\`\`\``);
-		return lines.join("\n");
-	}
-
-	if (!existsSync(abs)) {
-		lines.push(`**On disk:** \`${abs}\` does **not** exist (cwd=\`${process.cwd()}\`).`);
-		lines.push("");
-		lines.push("**Recover the real path:**");
-		lines.push(`1. Run \`find\` with pattern \`*${base}*\` (or the correct filename) from the repo root.`);
-		lines.push(`2. Or \`grep\` for a string that only appears in that file.`);
-		lines.push(`3. Use the path returned by the tool — copy it exactly into the next \`edit\` / \`read\`.`);
-		const hints = foundFiles.filter(
-			(f) =>
-				f.replace(/^\.\//, "").endsWith(base) ||
-				f.replace(/^\.\//, "").includes(base) ||
-				base.includes(basename(f)),
-		);
-		if (hints.length > 0) {
-			lines.push("");
-			lines.push("**Candidate paths already discovered in this session (try one):**");
-			for (const h of hints.slice(0, 8)) {
-				lines.push(`- \`${h}\``);
-			}
-		}
-		lines.push("");
-		lines.push("**Example bash (adapt the name):**");
-		lines.push(`\`\`\`bash`);
-		lines.push(`find . -type f -name '*${base}*' -not -path '*/node_modules/*' -not -path '*/.git/*' | head -20`);
-		lines.push(`\`\`\``);
-	} else {
-		try {
-			const st = statSync(abs);
-			if (!st.isFile()) {
-				lines.push(`**On disk:** \`${abs}\` exists but is not a regular file.`);
-			} else {
-				const buf = readFileSync(abs);
-				const probeLen = Math.min(buf.length, 16_384);
-				if (buf.subarray(0, probeLen).includes(0)) {
-					lines.push(
-						`**Binary or non-UTF8 file** at \`${abs}\` — inline snapshot skipped. Call \`read\` on \`${pathForDisk}\` (or use \`bash\` / \`xxd\` / \`file\` if you need raw inspection).`,
-					);
-				} else {
-					let body = buf.toString("utf8");
-					let truncated = false;
-					if (body.length > GEMINI_EDIT_RECOVERY_MAX_CHARS) {
-						body = body.slice(0, GEMINI_EDIT_RECOVERY_MAX_CHARS);
-						truncated = true;
-					}
-					const lang = fenceLangFromPath(abs);
-					lines.push(`**Current full file at \`${pathForDisk}\`** (resolved: \`${abs}\`)${truncated ? ` — **truncated** to ${GEMINI_EDIT_RECOVERY_MAX_CHARS} chars (file is larger). Re-\`read\` with offset/limit if needed.` : ""}:`);
-					lines.push(`\`\`\`${lang}`);
-					lines.push(escapeMarkdownFences(body));
-					lines.push("```");
-					lines.push("");
-					lines.push(
-						"Re-issue `edit` using **exact** `oldText` copied from the file above (whitespace, quotes, line endings). If you only need one line changed, anchor with 2–3 surrounding lines.",
-					);
-				}
-			}
-		} catch (e) {
-			lines.push(`**Could not read file:** ${e instanceof Error ? e.message : String(e)}`);
-		}
-	}
-
-	return lines.join("\n");
+	return out.join("\n");
 }
 
 /**
@@ -586,7 +502,6 @@ async function runLoop(
 	let hasProducedEdit = false;
 
 	const loopStart = Date.now();
-	let implementReadOnlyRequiredTurns = 0;
 	const pathsAlreadyRead = new Set<string>();
 	const pathReadCounts = new Map<string, number>();
 	let lastRereadNudgeAt = 0;
@@ -597,10 +512,24 @@ async function runLoop(
 
 	let executionMode: "plan" | "implement" = "plan";
 	let planSubmitted = false;
-	let confirmPhaseStarted = false;
-	let confirmPhaseDone = false;
-	let confirmCurrentPath: string | null = null;
-	const confirmPlanList = new Set<string>();
+	/**
+	 * Ultimate wall-clock time limit for the whole run (measured from loopStart).
+	 * When this is hit we end the run *successfully* even if not every plan is
+	 * finished. It exists so we always return a partial patch before the outer
+	 * harness (Docker 300s) hard-kills the process.
+	 */
+	const ULTIMATE_TIME_LIMIT_MS = 280_000;
+	/**
+	 * Minimum per-plan budget. Even when we are very late in the run, each plan
+	 * gets at least this many ms before the auto-advance kicks in so the model
+	 * has a real chance to land a single edit.
+	 */
+	const MIN_PLAN_BUDGET_MS = 15_000;
+	/**
+	 * We warn the model about the time-budget when less than this much remains
+	 * inside the current plan's budget.
+	 */
+	const PLAN_BUDGET_WARN_MS = 20_000;
 	const pendingTurnEndMarkerLines: string[] = [];
 	const rawEmit = emit;
 	emit = async (event: AgentEvent) => {
@@ -628,6 +557,226 @@ async function runLoop(
 	let absorbedFiles = new Set<string>();
 	const plannedFiles = new Set<string>();
 	const planByFile = new Map<string, string>();
+
+	/**
+	 * Implement mode is a simple sequential for-loop over plans.
+	 * `plannedOrder` preserves the submission order from the `plan` tool call;
+	 * `currentPlanIndex` is the plan currently being worked on. We advance past a
+	 * plan when the model calls the `editdone` tool. When `currentPlanIndex`
+	 * reaches `plannedOrder.length`, the run ends.
+	 */
+	const plannedOrder: Array<{ path: string; plan: string }> = [];
+	let currentPlanIndex = 0;
+	/**
+	 * Timestamp (ms) when the current plan started being worked on. Reset every
+	 * time `currentPlanIndex` advances (on `editdone` or budget-auto-advance) and
+	 * initialised when implement mode starts. Used together with the per-plan
+	 * budget to (a) tell the model how much time it has, and (b) auto-advance if
+	 * the plan runs over budget.
+	 */
+	let currentPlanStartedAt: number | null = null;
+
+	/**
+	 * Compute per-plan budget from (remaining time until ULTIMATE_TIME_LIMIT_MS)
+	 * divided evenly across the remaining plans. Floored to MIN_PLAN_BUDGET_MS
+	 * so we always give every plan a real shot even when time is tight.
+	 */
+	const computePlanBudgetMs = (): number => {
+		const elapsed = Date.now() - loopStart;
+		const remainingToUltimate = Math.max(0, ULTIMATE_TIME_LIMIT_MS - elapsed);
+		const remainingPlans = Math.max(1, plannedOrder.length - currentPlanIndex);
+		const share = Math.floor(remainingToUltimate / remainingPlans);
+		return Math.max(MIN_PLAN_BUDGET_MS, share);
+	};
+	/**
+	 * Paths the model successfully `read` during PLAN mode. Surfaced to the model
+	 * during IMPLEMENT mode so it knows which surrounding files are already in
+	 * scope and can `read` them again for additional context before editing.
+	 * Insertion-order is preserved.
+	 */
+	const planModeReadPaths: string[] = [];
+	const planModeReadPathSet = new Set<string>();
+	const recordPlanModeReadPath = (path: string): void => {
+		if (!path) return;
+		const norm = normalizePathForMatch(path);
+		if (!norm || planModeReadPathSet.has(norm)) return;
+		planModeReadPathSet.add(norm);
+		planModeReadPaths.push(norm);
+	};
+
+	/**
+	 * Build the implement-mode injection message for the current plan.
+	 * Contains: time-budget block, plan text, full current content of the target
+	 * file with 0-indexed line numbers, and an instruction to call
+	 * edit / write / editdone.
+	 *
+	 * `planStartedAt` is the wall-clock timestamp when the current plan started
+	 * being worked on; `budgetMs` is the per-plan budget computed for this plan.
+	 * Both are surfaced to the model so it understands its time envelope and can
+	 * prefer `editdone` over another risky retry when it is about to run out.
+	 */
+	const buildImplementInjectMessage = (
+		filepath: string,
+		planText: string,
+		idx: number,
+		totalPlans: number,
+		planStartedAt: number,
+		budgetMs: number,
+	): AgentMessage => {
+		let content = "";
+		try {
+			const { abs, ok } = safeResolvePathUnderCwd(filepath);
+			if (ok && existsSync(abs)) content = readFileSync(abs, "utf8");
+		} catch {
+			content = "";
+		}
+		const hasContent = content.length > 0;
+		const numbered = hasContent ? formatFileWithZeroIndexedLines(content) : "(file does not yet exist — use `write` to create it)";
+		// Paths recorded during PLAN mode (minus the current target file) — these
+		// are the files the model already explored while planning and may want to
+		// `read` again for surrounding-context before applying edits.
+		const targetNorm = normalizePathForMatch(filepath);
+		const contextPaths = planModeReadPaths.filter((p) => p !== targetNorm);
+		const contextBlock = contextPaths.length > 0
+			? `Paths already read during plan mode (**\`read\` only** — do not call \`edit\` or \`write\` on these):\n${contextPaths.map((p) => `- \`${p}\``).join("\n")}\n\n`
+			: "";
+
+		// Time-budget block. All numbers are whole seconds so the model can parse
+		// them easily. We compute elapsed *now* so the block is always fresh.
+		const now = Date.now();
+		const planElapsedMs = Math.max(0, now - planStartedAt);
+		const planRemainingMs = Math.max(0, budgetMs - planElapsedMs);
+		const totalElapsedMs = Math.max(0, now - loopStart);
+		const totalRemainingMs = Math.max(0, ULTIMATE_TIME_LIMIT_MS - totalElapsedMs);
+		const toSec = (ms: number): string => (ms / 1000).toFixed(1);
+		const warnLine =
+			planRemainingMs <= PLAN_BUDGET_WARN_MS
+				? `**WARNING**: only ${toSec(planRemainingMs)}s left in this plan's budget. `
+				: "";
+		const budgetBlock =
+			`Time budget for THIS plan (plan ${idx + 1}/${totalPlans}):\n` +
+			`- budget: ${toSec(budgetMs)}s\n` +
+			`- elapsed on this plan: ${toSec(planElapsedMs)}s\n` +
+			`- remaining in this plan: ${toSec(planRemainingMs)}s\n` +
+			`- total run budget remaining (ultimate ${toSec(ULTIMATE_TIME_LIMIT_MS)}s cap): ${toSec(totalRemainingMs)}s\n` +
+			(warnLine ? `${warnLine}\n` : "") +
+			"\n";
+
+		const body =
+			`IMPLEMENT plan ${idx + 1}/${totalPlans}: \`${filepath}\`\n\n` +
+			budgetBlock +
+			`Plan for this file:\n---\n${planText || "(no plan text)"}\n---\n\n` +
+			contextBlock +
+			`Current full content of \`${filepath}\` (0-indexed line numbers — use them directly as startLine/endLine in \`edit\`):\n` +
+			"```\n\n" +
+			escapeMarkdownFences(numbered) +
+			"\n```\n\n" +
+			`Call exactly ONE of these tools:\n` +
+			`- \`read\` — optional context from the paths above or elsewhere (**read-only** on non-plan files)\n` +
+			`- \`edit\` — line-range replacements **only** on \`${filepath}\`\n` +
+			`- \`write\` — full overwrite/create **only** for \`${filepath}\`\n` +
+			`- \`editdone\` — signal this plan is complete (payload: { filepath: "${filepath}", plan: <plan text>, completedevidence: <short justification> })`;
+		return {
+			role: "user",
+			content: [{ type: "text", text: body }],
+			timestamp: ((Date.now() - loopStart) / 1000),
+		};
+	};
+
+	/**
+	 * Convenience wrapper: build the inject message for the **current** plan
+	 * using the currently-tracked start time + a freshly-computed budget. All
+	 * call-sites in implement mode funnel through this so the budget info is
+	 * always consistent and up-to-date.
+	 */
+	const buildCurrentPlanInjectMessage = (): AgentMessage | null => {
+		if (currentPlanIndex >= plannedOrder.length) return null;
+		const p = plannedOrder[currentPlanIndex];
+		if (currentPlanStartedAt === null) currentPlanStartedAt = Date.now();
+		const budgetMs = computePlanBudgetMs();
+		return buildImplementInjectMessage(
+			p.path,
+			p.plan,
+			currentPlanIndex,
+			plannedOrder.length,
+			currentPlanStartedAt,
+			budgetMs,
+		);
+	};
+
+	/**
+	 * Index into `currentContext.messages` that marks the "stable prefix" for
+	 * implement mode — everything up to (but not including) the first implement-
+	 * mode injection. We never trim below this index: this is the prompt that
+	 * PLAN mode produced (task, discovery reads, `plan` tool call + result).
+	 * Set to -1 while we are still in PLAN mode.
+	 */
+	let implementModeBaseMsgIdx = -1;
+
+	/**
+	 * Recognise an implement-mode inject message ("IMPLEMENT plan N/M: `path`…").
+	 * All inject messages go through `buildImplementInjectMessage`, which always
+	 * starts the body with that literal prefix — so this test is reliable.
+	 */
+	const isImplementInjectMessage = (m: AgentMessage): boolean => {
+		if (m.role !== "user" || !Array.isArray(m.content)) return false;
+		const first = m.content[0] as { type?: string; text?: unknown } | undefined;
+		return typeof first?.text === "string" && (first.text as string).startsWith("IMPLEMENT plan ");
+	};
+
+	/**
+	 * Within-plan trim: keep at most ONE implement-mode inject live at a time.
+	 * Every re-inject on the current plan would otherwise stack another full
+	 * file-content dump into history (~6k tokens each), driving prompt size
+	 * from ~40k to 200k+ tokens and making every LLM call progressively slower.
+	 * We remove any existing inject (both in the pending queue and already
+	 * pushed into `currentContext.messages`) before queuing the new one.
+	 *
+	 * We do NOT touch assistant tool calls or their paired tool results, so the
+	 * LLM's tool_use/tool_result invariant is preserved; only the stale user-
+	 * message file dumps are discarded.
+	 */
+	const queueImplementInjectMessage = (msg: AgentMessage): void => {
+		pendingMessages = pendingMessages.filter((m) => !isImplementInjectMessage(m));
+		if (implementModeBaseMsgIdx >= 0) {
+			for (let i = currentContext.messages.length - 1; i >= implementModeBaseMsgIdx; i--) {
+				if (isImplementInjectMessage(currentContext.messages[i])) {
+					currentContext.messages.splice(i, 1);
+				}
+			}
+		}
+		pendingMessages.push(msg);
+	};
+
+	/**
+	 * Cross-plan wipe: when we advance past a completed (or budget-timed-out)
+	 * plan, drop EVERYTHING from that plan's iteration out of
+	 * `currentContext.messages`. We truncate back to `implementModeBaseMsgIdx`
+	 * — the prompt used for the next LLM call is then the stable PLAN-mode
+	 * prefix + the next plan's inject only.
+	 *
+	 * `newMessages` is intentionally left intact so the rollout / agent_end
+	 * log still reflects everything the agent actually did.
+	 */
+	const resetToImplementModeBase = (reason: string, fromPlanIndex: number): void => {
+		if (implementModeBaseMsgIdx < 0) return;
+		const before = currentContext.messages.length;
+		if (currentContext.messages.length > implementModeBaseMsgIdx) {
+			currentContext.messages.length = implementModeBaseMsgIdx;
+		}
+		const pendingBefore = pendingMessages.length;
+		pendingMessages = [];
+		if (before > implementModeBaseMsgIdx || pendingBefore > 0) {
+			void emitRolloutMarker("implement_context_trimmed", {
+				reason,
+				from_plan_index: fromPlanIndex,
+				to_plan_index: currentPlanIndex,
+				messages_dropped: before - implementModeBaseMsgIdx,
+				pending_dropped: pendingBefore,
+				base_idx: implementModeBaseMsgIdx,
+			});
+		}
+	};
 
 	type CriterionLedgerItem = {
 		id: number;
@@ -809,68 +958,10 @@ async function runLoop(
 		}
 		return missing;
 	};
-	const needsDeeperPlannedImplementation = (): string[] => {
-		const needsMore: string[] = [];
-		for (const pf of plannedFiles) {
-			const normPf = normalizePathForMatch(pf);
-			const planText = planByFile.get(normPf) ?? "";
-			if (!planText) continue;
-			const backtickRefs = (planText.match(/`[^`]+`/g) ?? []).length;
-			const hasDetailedEdits = planText.length >= 500 || backtickRefs >= 6;
-			if (!hasDetailedEdits) continue;
-			const editCount = pathEditCounts.get(normPf) ?? 0;
-			if (editCount < 2) needsMore.push(pf);
-		}
-		return needsMore;
-	};
-	const isPathEdited = (path: string): boolean => {
-		const n = normalizePathForMatch(path);
-		return editedPaths.has(n) || editedPaths.has("./" + n) || editedPaths.has(path);
-	};
-	const buildConfirmPrompt = (path: string): AgentMessage => {
-		const normPath = normalizePathForMatch(path);
-		const planText = planByFile.get(normPath) ?? "";
-		let fileContent = "";
-		try {
-			const { abs, ok } = safeResolvePathUnderCwd(normPath);
-			if (ok && existsSync(abs)) fileContent = readFileSync(abs, "utf8");
-		} catch {
-			fileContent = "";
-		}
-		const body = fileContent.length > 0 ? fileContent : "(file content unavailable)";
-		return {
-			role: "user",
-			content: [{
-				type: "text",
-				text:
-					`CONFIRMPLAN CHECK for \`${normPath}\`.\n` +
-					`Plan for this file:\n---\n${planText || "(missing plan text)"}\n---\n\n` +
-					`FULL edited file content:\n---\n${escapeMarkdownFences(body)}\n---\n\n` +
-					`Reply rules:\n` +
-					`- If perfect: reply exactly \`PERFECT\` (no tool call).\n` +
-					`- If imperfect: reply \`IMPERFECT\` and include an \`edit\` or \`write\` tool call for this same file in the same turn.\n` +
-					`- Do not switch files during this confirm step.`,
-			}],
-			timestamp: ((Date.now() - loopStart) / 1000),
-		};
-	};
-	const queueNextConfirmPrompt = (): boolean => {
-		if (confirmPlanList.size === 0) {
-			confirmCurrentPath = null;
-			confirmPhaseDone = true;
-			return false;
-		}
-		confirmCurrentPath = [...confirmPlanList][0] ?? null;
-		if (!confirmCurrentPath) {
-			confirmPhaseDone = true;
-			return false;
-		}
-		pendingMessages.push(buildConfirmPrompt(confirmCurrentPath));
-		return true;
-	};
 	const PLAN_MODE_MAX_MS = 100_000;
 	const IMPLEMENT_VERIFY_MAX_MS = 200_000;
 	const IMPLEMENT_READ_ONLY_REQUIRED_TURN_LIMIT = 3;
+
 	const hasFullReadForPath = (path: string): boolean => {
 		const norm = normalizePathForMatch(path);
 		return pathsAlreadyRead.has(norm) || pathsAlreadyRead.has("./" + norm);
@@ -1027,8 +1118,6 @@ async function runLoop(
 		return missing;
 	};
 	const GRACEFUL_EXIT_MS = 170_000;
-	/** Hard cap below common evaluator timeout (~600s) so landed edits are emitted before external cutoff. */
-	const ABSOLUTE_SESSION_CAP_MS = 500_000;
 	/** If identical tool-call signatures repeat with no new successful mutations, force-stop to preserve diff. */
 	const REPEATED_TOOL_SIGNATURE_LIMIT = 3;
 	let multiFileHintSent = false;
@@ -1103,26 +1192,6 @@ async function runLoop(
 		} catch {
 			// best-effort only
 		}
-	};
-	const maybeAddBreadthHintAfterRead = (readPath: string): void => {
-		if (executionMode !== "plan") return;
-		const normRead = readPath.replace(/^\.\//, "");
-		const uneditedTargets = foundFiles.filter((f: string) => {
-			const nf = f.replace(/^\.\//, "");
-			return !editedPaths.has(f) && !editedPaths.has(nf) && !editedPaths.has("./" + nf);
-		});
-		if (uneditedTargets.length === 0) return;
-		const readEditCount = pathEditCounts.get(normRead) ?? 0;
-		const repeatedReadSameFile = (pathReadCounts.get(readPath) ?? 0) >= 2;
-		const breadthHintText =
-			repeatedReadSameFile || readEditCount >= 2
-				? `PLAN breadth hint: stop focusing on \`${normRead}\`. ${uneditedTargets.length} target file(s) are still untouched: ${uneditedTargets.slice(0, 6).map((f: string) => `\`${f}\``).join(", ")}. Read the next highest-signal uninspected file.`
-				: `PLAN breadth hint: ${uneditedTargets.length} candidate file(s) remain: ${uneditedTargets.slice(0, 6).map((f: string) => `\`${f}\``).join(", ")}. Continue discovery breadth-first before final \`plan\`.`;
-		pendingMessages.push({
-			role: "user",
-			content: [{ type: "text", text: breadthHintText }],
-			timestamp: ((Date.now() - loopStart) / 1000),
-		});
 	};
 	const maybeAddSiblingHintAfterRead = async (readPath: string): Promise<void> => {
 		if (executionMode !== "plan") return;
@@ -1263,9 +1332,17 @@ async function runLoop(
 				firstTurn = false;
 			}
 
-			// Hard session cap must run every iteration — many `continue` paths skip the tool tail,
-			// so a bottom-only check lets the loop run until an external harness timeout.
-			if ((Date.now() - loopStart) >= ABSOLUTE_SESSION_CAP_MS) {
+			// Ultimate wall-clock guard: once ULTIMATE_TIME_LIMIT_MS has elapsed since
+			// the start of the run, end the agent *successfully* so whatever edits
+			// have been landed so far are returned as a partial solution instead of
+			// being lost to an external harness hard-kill (Docker 300s, etc.).
+			if ((Date.now() - loopStart) >= ULTIMATE_TIME_LIMIT_MS) {
+				await emitRolloutMarker("ultimate_time_limit_reached", {
+					elapsed_ms: Date.now() - loopStart,
+					limit_ms: ULTIMATE_TIME_LIMIT_MS,
+					completed_plans: currentPlanIndex,
+					total_plans: plannedOrder.length,
+				});
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
@@ -1294,21 +1371,6 @@ async function runLoop(
 
 			const planBudgetExceeded =
 				executionMode === "plan" && !planSubmitted && (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
-			const implementNeedsProgress =
-				executionMode === "implement" &&
-				(
-					missingPlannedFiles().length > 0 ||
-					needsDeeperPlannedImplementation().length > 0
-				);
-			const forceImplementMutationChoice =
-				executionMode === "implement" &&
-				implementNeedsProgress &&
-				implementReadOnlyRequiredTurns >= IMPLEMENT_READ_ONLY_REQUIRED_TURN_LIMIT;
-			// During CONFIRMPLAN the model is expected to reply with `PERFECT` as plain text
-			// (no tool) or `IMPERFECT` + edit/write. "required"/forced edit would block the
-			// PERFECT path and trap the loop until the hard cutoff. Relax tool choice here.
-			const isConfirmTurn =
-				executionMode === "implement" && confirmPhaseStarted && confirmCurrentPath !== null;
 
 			const message = await streamAssistantResponse(
 				currentContext,
@@ -1317,24 +1379,16 @@ async function runLoop(
 				emit,
 				streamFn,
 				{
-					// PLAN mode must never burn turns on prose-only replies; Gemini often does that unless forced.
-					// After the PLAN wall clock budget, force a real `plan` tool call so discovery-only loops cannot stall.
+					// PLAN mode: force a tool call (once past the time budget, force `plan` specifically).
+					// IMPLEMENT mode: force a tool call so the model must emit edit / write / editdone.
 					toolChoice:
 						executionMode === "plan" && !planSubmitted
 							? planBudgetExceeded
 								? ({ type: "function", function: { name: "plan" } } as const)
 								: ("required" as const)
 							: executionMode === "implement"
-								? (
-									isConfirmTurn
-										? ("auto" as const)
-										: forceImplementMutationChoice
-											? ({ type: "function", function: { name: "edit" } } as const)
-											: ("required" as const)
-								)
-								: implementNeedsProgress
-									? ("required" as const)
-									: undefined,
+								? ("required" as const)
+								: undefined,
 				},
 				llmSystemPrompt,
 			);
@@ -1552,12 +1606,17 @@ async function runLoop(
 						}
 						if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall" && tc.name === "read") {
 							const path = resolvedLoopPathForTool(tc) ?? "";
-							if (path) absorbedFiles.add(path);
+							if (path) {
+								absorbedFiles.add(path);
+								// Record every successful PLAN-mode read so the implement
+								// phase can surface these paths to the model as candidate
+								// context files.
+								recordPlanModeReadPath(path);
+							}
 							const rArgs = tc.arguments as { offset?: number; limit?: number } | undefined;
 							const isFullRead = typeof rArgs?.offset === "undefined" && typeof rArgs?.limit === "undefined";
 							if (isFullRead && path) {
 								addReadPathVariants(pathsAlreadyRead, path);
-								maybeAddBreadthHintAfterRead(path);
 								await maybeAddSiblingHintAfterRead(path);
 								pathReadCounts.set(path, (pathReadCounts.get(path) ?? 0) + 1);
 							}
@@ -1681,16 +1740,30 @@ async function runLoop(
 						planSubmitted = true;
 						executionMode = "implement";
 						implementModeStartedAt = Date.now();
-						confirmPhaseStarted = false;
-						confirmPhaseDone = false;
-						confirmCurrentPath = null;
-						confirmPlanList.clear();
-						await emitRolloutMarker("mode_transition", { from: "plan", to: "implement", reason: "plan_submitted" });
-						pendingMessages.push({
-							role: "user",
-							content: [{ type: "text", text: `Switched to IMPLEMENT mode. Implement all planned files with minimal, style-matched edits. Planned files: ${[...plannedFiles].slice(0, 100).map((p) => `\`${p}\``).join(", ")}. Call \`read\` first (full file) before \`edit\`/\`write\` on that file.` }],
-							timestamp: ((Date.now() - loopStart) / 1000),
+						// Build the ordered plan list that drives the implement-mode for-loop.
+						plannedOrder.length = 0;
+						for (const p of plans) {
+							const path = typeof p?.path === "string" ? p.path.trim() : "";
+							const planText = typeof p?.plan === "string" ? p.plan.trim() : "";
+							if (path.length > 0) plannedOrder.push({ path, plan: planText });
+						}
+						currentPlanIndex = 0;
+						currentPlanStartedAt = Date.now();
+						// Freeze the "stable prefix" for implement mode: everything in
+						// `currentContext.messages` up to this point (the task,
+						// discovery, `plan` tool call + result) will always be preserved
+						// by both the within-plan and cross-plan trim helpers.
+						implementModeBaseMsgIdx = currentContext.messages.length;
+						await emitRolloutMarker("mode_transition", {
+							from: "plan",
+							to: "implement",
+							reason: "plan_submitted",
+							implement_base_msg_idx: implementModeBaseMsgIdx,
 						});
+						if (plannedOrder.length > 0) {
+							const firstMsg = buildCurrentPlanInjectMessage();
+							if (firstMsg) queueImplementInjectMessage(firstMsg);
+						}
 					}
 
 					const now = Date.now();
@@ -1722,250 +1795,174 @@ async function runLoop(
 					}
 				}
 			} else if (executionMode === "implement") {
-				if (confirmPhaseStarted && confirmCurrentPath) {
-					const assistantText = message.content
-						.filter((c: any) => c?.type === "text" && typeof c?.text === "string")
-						.map((c: any) => c.text)
-						.join("\n");
-					const hasPerfect = /\bPERFECT\b/.test(assistantText);
-					const hasImperfect = /\bIMPERFECT\b/.test(assistantText);
-					const hasFixCall = toolCalls.some((tc) => tc.name === "edit" || tc.name === "write");
-					if (hasPerfect && !hasFixCall) {
-						confirmPlanList.delete(confirmCurrentPath);
-						confirmCurrentPath = null;
-						await emit({ type: "turn_end", message, toolResults: [] });
-						if (!queueNextConfirmPrompt()) {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: "All planned files confirmed PERFECT." }],
-								timestamp: ((Date.now() - loopStart) / 1000),
-							});
-						}
-						hasMoreToolCalls = false;
-						continue;
-					}
-					if (hasImperfect && !hasFixCall) {
-						await emit({ type: "turn_end", message, toolResults: [] });
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `CONFIRMPLAN for \`${confirmCurrentPath}\`: you returned IMPERFECT without a fix tool call. Submit \`edit\` or \`write\` for this file now.`,
-							}],
-							timestamp: ((Date.now() - loopStart) / 1000),
-						});
-						hasMoreToolCalls = false;
-						continue;
-					}
-					if (hasFixCall) {
-						const badTarget = toolCalls.some((tc) => {
-							if (tc.name !== "edit" && tc.name !== "write") return false;
-							const p = resolvedLoopPathForTool(tc);
-							if (!p) return false;
-							const np = normalizePathForMatch(p);
-							const nc = normalizePathForMatch(confirmCurrentPath!);
-							return !(np === nc || np.endsWith("/" + nc) || nc.endsWith("/" + np));
-						});
-						if (badTarget) {
-							await emit({ type: "turn_end", message, toolResults: [] });
-							pendingMessages.push({
-								role: "user",
-								content: [{
-									type: "text",
-									text: `CONFIRMPLAN fix calls must target only \`${confirmCurrentPath}\`. Retry with \`edit\`/\`write\` for that file.`,
-								}],
-								timestamp: ((Date.now() - loopStart) / 1000),
-							});
-							hasMoreToolCalls = false;
-							continue;
-						}
-					}
-					if (!hasMoreToolCalls && !hasPerfect && !hasImperfect) {
-						await emit({ type: "turn_end", message, toolResults: [] });
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `CONFIRMPLAN for \`${confirmCurrentPath}\`: reply with \`PERFECT\` or \`IMPERFECT\` (+ fix tool call).`,
-							}],
-							timestamp: ((Date.now() - loopStart) / 1000),
-						});
-						continue;
-					}
+				// Simple per-plan for-loop:
+				//   1. When entering implement mode (or after an `editdone`), the plan-
+				//      submission block above pushes a message containing the target
+				//      file's current full content + plan and asks for edit/write/editdone.
+				//   2. Each turn, the model must call `read`, `edit`, `write`, or `editdone`.
+				//   3. After `edit`/`write` on the current plan path only, we execute the
+				//      tool and re-inject the (possibly updated) file content + plan
+				//      with the same "call edit/write/editdone" instruction.
+				//   4. After `editdone`, we advance to the next plan (or finish if the
+				//      model has called editdone once per plan).
+				if (currentPlanIndex >= plannedOrder.length) {
+					await emit({ type: "turn_end", message, toolResults: [] });
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
 				}
-				const isImplementReadOnlyTurn =
-					implementNeedsProgress &&
-					hasMoreToolCalls &&
-					toolCalls.every((tc) => tc.name === "read");
-				if (isImplementReadOnlyTurn) {
-					implementReadOnlyRequiredTurns++;
-				} else if (hasMoreToolCalls || !implementNeedsProgress) {
-					implementReadOnlyRequiredTurns = 0;
-				}
-				if (
-					isImplementReadOnlyTurn &&
-					implementReadOnlyRequiredTurns >= IMPLEMENT_READ_ONLY_REQUIRED_TURN_LIMIT &&
-					pendingMessages.length === 0
-				) {
-					const remainingPlanned = missingPlannedFiles();
-					const shallowPlanned = needsDeeperPlannedImplementation();
-					const nextTarget = remainingPlanned[0] ?? shallowPlanned[0] ?? [...plannedFiles][0] ?? "";
-					pendingMessages.push({
-						role: "user",
-						content: [{
-							type: "text",
-							text: `Implement-mode anti-stall: ${implementReadOnlyRequiredTurns} consecutive read-only turns while planned work remains. Stop read-only turns and apply \`edit\` or \`write\` now${nextTarget ? ` on \`${nextTarget}\`` : ""}.`,
-						}],
-						timestamp: ((Date.now() - loopStart) / 1000),
-					});
-				}
+
+				const currentPlan = plannedOrder[currentPlanIndex];
+
 				if (!hasMoreToolCalls) {
 					await emit({ type: "turn_end", message, toolResults: [] });
-					// Only require a tool call when planned implementation work is still pending.
-					// If all planned files are already edited and the confirm phase has not started,
-					// let flow fall through to the bottom-of-loop exit gate so the confirm phase
-					// can be initiated. Otherwise we would spin in a "requires tool calls" loop
-					// and the confirm phase would never start.
-					// If the confirm phase is already running, the CONFIRMPLAN reply handler above
-					// has already pushed its own reminder and `continue`d, so this branch only
-					// runs when confirm is not active.
-					if (implementNeedsProgress && !confirmPhaseStarted) {
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: "IMPLEMENT mode requires tool calls every turn. Call `read`, `edit`, or `write` now for planned files only.",
-							}],
-							timestamp: ((Date.now() - loopStart) / 1000),
-						});
-						continue;
-					}
-					// No planned work left AND confirm not started -> allow fall-through so the
-					// exit-gate at the bottom of the loop can start the confirm phase on the next
-					// iteration.
-				}
-				if (hasMoreToolCalls) {
-					const implementAllowed = new Set(["read", "edit", "write"]);
-					const disallowed = toolCalls.filter((tc) => !implementAllowed.has(tc.name));
-					if (disallowed.length > 0) {
-						await emit({ type: "turn_end", message, toolResults: [] });
-						const blocked = disallowed.map((tc) => `\`${tc.name}\``).join(", ");
-						const allowList = [...implementAllowed].map((n) => `\`${n}\``).join(", ");
-						pendingMessages.push({
-							role: "user",
-							content: [{ type: "text", text: `Mode violation: ${blocked} is not allowed in IMPLEMENT mode. Allowed tools: ${allowList}.` }],
-							timestamp: ((Date.now() - loopStart) / 1000),
-						});
-						hasMoreToolCalls = false;
-						continue;
-					}
-					if (!hasMoreToolCalls) {
-						await emit({ type: "turn_end", message, toolResults: [] });
-						continue;
-					}
-
-					const toolSignature = toolCalls.map((tc: any) => {
-						if (!tc || tc.type !== "toolCall") return "invalid";
-						const args = tc.arguments as Record<string, unknown> | undefined;
-						const p = typeof args?.path === "string" ? args.path : "";
-						const fp = typeof args?.file_path === "string" ? args.file_path : "";
-						return `${tc.name}:${p || fp}`;
-					}).join("|");
-					if (toolSignature.length > 0) {
-						if (toolSignature === lastToolSignature) repeatedToolSignatureCount++;
-						else {
-							lastToolSignature = toolSignature;
-							repeatedToolSignatureCount = 1;
-							lastSignatureMutationCount = successfulMutationCount;
-						}
-					}
-
-					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit, loopStart)));
-					for (const result of toolResults) {
-						currentContext.messages.push(result);
-						newMessages.push(result);
-					}
-
-					for (let i = 0; i < toolResults.length; i++) {
-						const tr = toolResults[i];
-						const tc = toolCalls[i];
-						if (!tc || tc.type !== "toolCall") continue;
-						if (tc.name === "write") {
-							const targetPath = resolvedLoopPathForTool(tc);
-							if (!targetPath) continue;
-							if (tr.isError) {
-								if (pendingMessages.length === 0) pendingMessages.push({ role: "user", content: [{ type: "text", text: `Write failed for \`${targetPath}\`. Check path and arguments; retry with \`write\` or switch to \`edit\` on an existing file.` }], timestamp: ((Date.now() - loopStart) / 1000) });
-								continue;
-							}
-							await recordSuccessfulFileMutation(targetPath);
-							continue;
-						}
-						if (tc.name !== "edit") continue;
-						const targetPath = resolvedLoopPathForTool(tc);
-						if (!targetPath) continue;
-						if (tr.isError) {
-							const errText = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-							if (pendingMessages.length === 0) {
-								pendingMessages.push({
-									role: "user",
-									content: [{ type: "text", text: buildGeminiEditFailureRecoveryMessage(targetPath, errText, tc, foundFiles) }],
-									timestamp: ((Date.now() - loopStart) / 1000),
-								});
-							}
-						} else {
-							await recordSuccessfulFileMutation(targetPath);
-							refreshNetChangedStateForPath(targetPath);
-						}
-					}
-
-					for (let i = 0; i < toolResults.length; i++) {
-						const tr = toolResults[i];
-						const tc = toolCalls[i];
-						if (tr.toolName !== "read" || tr.isError || !tc || tc.type !== "toolCall") continue;
-						const readPath = resolvedLoopPathForTool(tc);
-						if (!readPath) continue;
-						const rArgs = tc.arguments as { offset?: number; limit?: number } | undefined;
-						const isFullRead = typeof rArgs?.offset === "undefined" && typeof rArgs?.limit === "undefined";
-						if (!isFullRead) continue;
-						addReadPathVariants(pathsAlreadyRead, readPath);
-						const normRead = normalizePathForMatch(readPath);
-						const readText = tr.content?.map((c: any) => c?.text ?? "").join("") ?? "";
-						if (!baselineFileContentByPath.has(normRead) && readText.length > 0) {
-							baselineFileContentByPath.set(normRead, readText);
-						}
-						const planText = planByFile.get(normRead) ?? "";
-						if (pendingMessages.length === 0) {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: `IMPLEMENT read loaded \`${readPath}\`. Next action must be \`edit\`/\`write\` for planned changes only.${planText ? `\n\nPlanned edits for this file:\n${planText}` : ""}\n\nMatch existing local style (naming, formatting, surrounding patterns) in this file.` }],
-								timestamp: ((Date.now() - loopStart) / 1000),
-							});
-						}
-					}
-					if (confirmPhaseStarted && confirmCurrentPath && hasMoreToolCalls && pendingMessages.length === 0) {
-						pendingMessages.push(buildConfirmPrompt(confirmCurrentPath));
-					}
-				}
-			}
-			const noProgressSinceSignature = successfulMutationCount === lastSignatureMutationCount;
-			if (
-				hasProducedEdit &&
-				repeatedToolSignatureCount >= REPEATED_TOOL_SIGNATURE_LIMIT &&
-				noProgressSinceSignature &&
-				planSubmitted &&
-				pendingMessages.length === 0
-			) {
-				if (executionMode === "implement" && netChangedPaths.size === 0) {
 					pendingMessages.push({
 						role: "user",
 						content: [{
 							type: "text",
-							text: "No net persisted edits detected yet. Continue implement mode with concrete edit/write calls that leave actual file changes.",
+							text:
+								`You must call a tool. For the current plan (\`${currentPlan.path}\`), call \`read\`, \`edit\`, \`write\`, or \`editdone\` now. ` +
+								`Only \`edit\` and \`write\` may target \`${currentPlan.path}\`; plan-mode paths are for \`read\` only.`,
 						}],
 						timestamp: ((Date.now() - loopStart) / 1000),
 					});
 					continue;
 				}
+
+				// Execute tools; `edit`/`write` are only executed when the path matches the current plan file.
+				toolResults.push(
+					...(await executeImplementModeToolCalls(
+						currentContext,
+						message,
+						toolCalls,
+						currentPlan.path,
+						config,
+						signal,
+						emit,
+						loopStart,
+					)),
+				);
+				for (const result of toolResults) {
+					currentContext.messages.push(result);
+					newMessages.push(result);
+				}
+
+				// Record successful file mutations for stats only (not used as a guard).
+				for (let i = 0; i < toolResults.length; i++) {
+					const tr = toolResults[i];
+					const tc = toolCalls[i];
+					if (!tc || tc.type !== "toolCall") continue;
+					if (tr.isError) continue;
+					if (tc.name === "edit" || tc.name === "write") {
+						const p = resolvedLoopPathForTool(applyRobustWorkspacePathsToToolCall(tc));
+						if (p) {
+							await recordSuccessfulFileMutation(p);
+							refreshNetChangedStateForPath(p);
+						}
+					}
+				}
+
+				// Did the model signal the current plan is done?
+				const hasEditdone = toolCalls.some((tc) => tc.name === "editdone");
+				if (hasEditdone) {
+					const completedPlanIndex = currentPlanIndex;
+					currentPlanIndex++;
+					currentPlanStartedAt = Date.now();
+					if (currentPlanIndex >= plannedOrder.length) {
+						await emit({ type: "turn_end", message, toolResults });
+						await emit({ type: "agent_end", messages: newMessages });
+						return;
+					}
+					// Drop the just-completed plan's iteration from context so the next
+					// plan starts with the stable PLAN-mode prefix + one fresh inject.
+					await emit({ type: "turn_end", message, toolResults });
+					resetToImplementModeBase("editdone_advance", completedPlanIndex);
+					const nextMsg = buildCurrentPlanInjectMessage();
+					if (nextMsg) queueImplementInjectMessage(nextMsg);
+					continue;
+				}
+
+				let hadEditLineFailure = false;
+				for (let i = 0; i < toolResults.length; i++) {
+					const tr = toolResults[i];
+					const tc = toolCalls[i];
+					if (!tc || tc.type !== "toolCall" || tc.name !== "edit" || !tr.isError) continue;
+					const errText = (tr.content ?? [])
+						.filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof (c as { text?: unknown }).text === "string")
+						.map((c) => c.text)
+						.join("\n");
+					// Wrong-path blocks are a different issue; only nudge line numbers for real edit failures.
+					if (errText.includes("Implement mode:") && errText.includes("must target ONLY")) continue;
+					hadEditLineFailure = true;
+					break;
+				}
+				if (hadEditLineFailure) {
+					pendingMessages.push({
+						role: "user",
+						content: [{
+							type: "text",
+							text:
+								"Your `edit` tool call failed. You memory is wrong. Refresh your memory with the new content of target file. Re-check `oldText` against the **refreshed** file content. After that, make `edit` tool call payload correctly and call `edit` tool again with correct payload. Do not repeat the same mistake.",
+						}],
+						timestamp: ((Date.now() - loopStart) / 1000),
+					});
+				}
+
+				// Per-plan time budget auto-advance: if the current plan has already
+				// consumed more than its share of the remaining ultimate budget, skip
+				// ahead to the next plan instead of re-injecting the same context and
+				// wasting more time on a stuck `edit` loop. This is the key guard that
+				// prevents getting stuck on plan N/K while plans N+1..K never run.
+				if (currentPlanStartedAt !== null) {
+					const planElapsed = Date.now() - currentPlanStartedAt;
+					const planBudget = computePlanBudgetMs();
+					if (planElapsed >= planBudget) {
+						await emitRolloutMarker("plan_budget_exceeded", {
+							plan_index: currentPlanIndex,
+							plan_path: currentPlan.path,
+							elapsed_ms: planElapsed,
+							budget_ms: planBudget,
+						});
+						const abandonedPlanIndex = currentPlanIndex;
+						currentPlanIndex++;
+						currentPlanStartedAt = Date.now();
+						if (currentPlanIndex >= plannedOrder.length) {
+							await emit({ type: "turn_end", message, toolResults });
+							await emit({ type: "agent_end", messages: newMessages });
+							return;
+						}
+						// Same cross-plan wipe as the editdone path: the next plan
+						// starts from the clean PLAN-mode prefix.
+						await emit({ type: "turn_end", message, toolResults });
+						resetToImplementModeBase("plan_budget_exceeded", abandonedPlanIndex);
+						const skipMsg = buildCurrentPlanInjectMessage();
+						if (skipMsg) queueImplementInjectMessage(skipMsg);
+						continue;
+					}
+				}
+
+				// After any edit/write (successful or not), re-inject the current file
+				// content + plan + instruction. This is the "second step" of the per-plan
+				// loop: the agent always follows up a tool call with the refreshed context
+				// so the model can either continue editing or call `editdone`.
+				//
+				// `queueImplementInjectMessage` keeps at most ONE inject live at a
+				// time: any prior inject for this plan is removed before the new one
+				// is queued, so within-plan prompt growth stays bounded (~1 inject
+				// instead of N stacked file dumps).
+				const reinjectMsg = buildCurrentPlanInjectMessage();
+				if (reinjectMsg) queueImplementInjectMessage(reinjectMsg);
+			}
+			// Plan-mode-only stall exit. Implement-mode completion is decided by the
+			// per-plan for-loop (on the Nth `editdone`), so we never terminate here
+			// for implement mode regardless of tool-signature repetition.
+			if (
+				executionMode === "plan" &&
+				hasProducedEdit &&
+				repeatedToolSignatureCount >= REPEATED_TOOL_SIGNATURE_LIMIT &&
+				successfulMutationCount === lastSignatureMutationCount &&
+				planSubmitted &&
+				pendingMessages.length === 0
+			) {
 				await emit({ type: "turn_end", message, toolResults });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -1974,36 +1971,9 @@ async function runLoop(
 			await emit({ type: "turn_end", message, toolResults });
 
 			// Preserve in-loop nudges (e.g. PLAN->IMPLEMENT handoff) and append external steering.
-			// Overwriting here can drop critical transition instructions and cause no-op implement turns.
 			const steeringMessages = (await config.getSteeringMessages?.()) || [];
 			if (steeringMessages.length > 0) {
 				pendingMessages.push(...steeringMessages);
-			}
-
-			// Do not cut off mid-session right after tools when exploration already burned the budget (task11-style:
-			// long reads then one edit). Only apply the soft time limit when the model ends a turn with no tool calls.
-			if (
-				!hasMoreToolCalls &&
-				pendingMessages.length === 0 &&
-				executionMode === "implement" &&
-				hasProducedEdit &&
-				missingPlannedFiles().length === 0 &&
-				implementModeStartedAt !== null &&
-				(Date.now() - implementModeStartedAt) >= GRACEFUL_EXIT_MS
-			) {
-				if (netChangedPaths.size === 0) {
-					pendingMessages.push({
-						role: "user",
-						content: [{
-							type: "text",
-							text: "No net file changes are currently detected versus earlier reads. Do not stop. Re-read target planned files and apply concrete edits that persist on disk.",
-						}],
-						timestamp: ((Date.now() - loopStart) / 1000),
-					});
-					continue;
-				}
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
 			}
 		}
 
@@ -2013,7 +1983,7 @@ async function runLoop(
 			pendingMessages = followUpMessages;
 			continue;
 		}
-		// Hard cutoff for implementation flow: stop after 200s.
+		// Hard cutoff for implementation flow: stop after IMPLEMENT_VERIFY_MAX_MS.
 		if (
 			executionMode === "implement" &&
 			implementModeStartedAt !== null &&
@@ -2021,12 +1991,7 @@ async function runLoop(
 		) {
 			break;
 		}
-		// IMPORTANT: In IMPLEMENT mode, plans are the frozen contract. Do NOT nudge the model
-		// about task-derived "expected/explicit/criterion" files, because they can include
-		// files that were never planned (e.g., sibling modules surfaced by PLAN-mode discovery).
-		// Any off-plan nudge here distracts the model and forces out-of-scope edits.
-		// Plan-scoped exit gates below (missingPlannedFiles / needsDeeperPlannedImplementation)
-		// are the ONLY allowed post-edit continue signals in IMPLEMENT mode.
+
 		if (executionMode === "plan") {
 			pendingMessages = [{
 				role: "user",
@@ -2037,83 +2002,38 @@ async function runLoop(
 				timestamp: ((Date.now() - loopStart) / 1000),
 			}];
 			continue;
-		} else if (executionMode === "implement") {
-			if (!planSubmitted) {
-				await emitRolloutMarker("mode_transition", { from: "implement", to: "plan", reason: "invariant_correction" });
-				executionMode = "plan";
-				confirmPhaseStarted = false;
-				confirmPhaseDone = false;
-				confirmCurrentPath = null;
-				confirmPlanList.clear();
-				pendingMessages = [{
-					role: "user",
-					content: [{
-						type: "text",
-						text: "Invariant correction: implement mode requires successful `plan` tool call first. Return to PLAN mode, finish planning, and call `plan` tool with exact JSON format.",
-					}],
-					timestamp: ((Date.now() - loopStart) / 1000),
-				}];
-				continue;
-			}
-			const missingFromPlan = missingPlannedFiles();
-			if (missingFromPlan.length > 0) {
-				pendingMessages = [{
-					role: "user",
-					content: [{
-						type: "text",
-						text: `Do not stop. Planned files still unedited: ${missingFromPlan.slice(0, 10).map((f) => `\`${f}\``).join(", ")}. Implement all planned files.`,
-					}],
-					timestamp: ((Date.now() - loopStart) / 1000),
-				}];
-				continue;
-			}
-			const shallowPlanned = needsDeeperPlannedImplementation();
-			if (shallowPlanned.length > 0) {
-				pendingMessages = [{
-					role: "user",
-					content: [{
-						type: "text",
-						text: `Do not stop yet. These planned files have high-detail plans but too little implementation evidence: ${shallowPlanned
-							.slice(0, 8)
-							.map((f) => `\`${f}\``)
-							.join(", ")}. Continue implementing those plan details before stopping.`,
-					}],
-					timestamp: ((Date.now() - loopStart) / 1000),
-				}];
-				continue;
-			}
-			if (!confirmPhaseDone) {
-				if (!confirmPhaseStarted) {
-					confirmPhaseStarted = true;
-					for (const pf of plannedFiles) {
-						if (isPathEdited(pf)) confirmPlanList.add(normalizePathForMatch(pf));
-					}
-				}
-				if (confirmCurrentPath === null && queueNextConfirmPrompt()) {
-					continue;
-				}
-			}
 		}
-		// Review pass: if finished quickly and edits were made, check for missed files
-		const reviewElapsed = Date.now() - loopStart;
-		// Previously capped at 60s, which skipped the review nudge on slow models (exploration alone could exceed it).
-		if (!reviewPassDone && hasProducedEdit && reviewElapsed < ABSOLUTE_SESSION_CAP_MS) {
-			reviewPassDone = true;
-			const uneditedTargets = foundFiles.filter(
-				(f: string) => {
-					const nf = f.replace(/^\.\//, "");
-					return !editedPaths.has(f) && !editedPaths.has(nf) && !editedPaths.has("./" + nf);
-				}
-			);
-			const hint = uneditedTargets.length > 0
-				? `Unedited discovered files: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Check whether any still map to unmet acceptance criteria; edit only the required ones.`
-				: `Re-read the task acceptance criteria. If the task listed exact old strings or labels, grep the repo for any that remain. Are there files or criteria you missed? If yes, discover and edit them. If all criteria are covered, reply "done".`;
-			pendingMessages = [{
-				role: "user",
-				content: [{ type: "text", text: `REVIEW: You edited ${editedPaths.size} file(s): ${[...editedPaths].slice(0, 8).join(", ")}. ${hint}` }],
-				timestamp: ((Date.now() - loopStart) / 1000),
-			}];
-			continue;
+
+		if (executionMode === "implement") {
+			if (!planSubmitted) {
+				await emitRolloutMarker("mode_transition", {
+					from: "implement",
+					to: "plan",
+					reason: "invariant_correction",
+				});
+				executionMode = "plan";
+				pendingMessages = [{
+					role: "user",
+					content: [{
+						type: "text",
+						text:
+							"Invariant correction: implement mode requires a successful `plan` tool call first. Return to PLAN mode and submit a valid plan.",
+					}],
+					timestamp: ((Date.now() - loopStart) / 1000),
+				}];
+				continue;
+			}
+			// If the per-plan for-loop is not yet exhausted, keep going: re-inject the
+			// current plan's context so the model must call edit/write/editdone again.
+			// Route through the trim-aware queue helper so we do not stack another
+			// file-content dump on top of any stale inject still in context.
+			if (currentPlanIndex < plannedOrder.length) {
+				const cur = buildCurrentPlanInjectMessage();
+				if (cur) queueImplementInjectMessage(cur);
+				continue;
+			}
+			// All plans signalled done — exit.
+			break;
 		}
 
 		// No more messages, exit
@@ -2246,6 +2166,82 @@ async function executeToolCalls(
 		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit, loopStart);
 	}
 	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, loopStart);
+}
+
+/** Same normalization as in-loop `normalizePathForMatch` for implement-mode path checks. */
+function normalizeImplementPlanPath(p: string): string {
+	return p.replace(/^\.\//, "");
+}
+
+/**
+ * Implement mode: run tool calls sequentially and ensure `edit` / `write` only touch
+ * the current planned file. Other paths from plan mode exist for `read` only.
+ */
+async function executeImplementModeToolCalls(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	toolCalls: AgentToolCall[],
+	plannedTargetPath: string,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	loopStart: number,
+): Promise<ToolResultMessage[]> {
+	const planNorm = normalizeImplementPlanPath(plannedTargetPath.trim());
+	const results: ToolResultMessage[] = [];
+
+	for (const toolCall of toolCalls) {
+		const tc = applyRobustWorkspacePathsToToolCall(toolCall);
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: tc.id,
+			toolName: tc.name,
+			args: tc.arguments,
+		});
+
+		if (tc.name === "edit" || tc.name === "write") {
+			const resolved = resolvedLoopPathForTool(tc);
+			const toolNorm = resolved ? normalizeImplementPlanPath(resolved) : "";
+			if (!resolved || toolNorm !== planNorm) {
+				const wrong = resolved ?? rawPathFromToolArguments(tc.arguments)?.trim() ?? "(missing path)";
+				results.push(
+					await emitToolCallOutcome(
+						tc,
+						createErrorToolResult(
+							`Implement mode: \`${tc.name}\` must target ONLY the current planned file \`${plannedTargetPath}\`. ` +
+								`You targeted \`${wrong}\`. ` +
+								`Paths recorded during plan mode are for \`read\` only — call \`edit\` or \`write\` with path exactly \`${plannedTargetPath}\`.`,
+						),
+						true,
+						emit,
+						loopStart,
+					),
+				);
+				continue;
+			}
+		}
+
+		const preparation = await prepareToolCall(currentContext, assistantMessage, tc, config, signal);
+		if (preparation.kind === "immediate") {
+			results.push(await emitToolCallOutcome(tc, preparation.result, preparation.isError, emit, loopStart));
+		} else {
+			const executed = await executePreparedToolCall(preparation, signal, emit);
+			results.push(
+				await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					preparation,
+					executed,
+					config,
+					signal,
+					emit,
+					loopStart,
+				),
+			);
+		}
+	}
+
+	return results;
 }
 
 async function executeToolCallsSequential(

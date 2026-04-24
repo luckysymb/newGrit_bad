@@ -276,7 +276,7 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			const secondCount = second ? second[1].size : 0;
 			if (topCount >= 3 && (second === undefined || topCount >= secondCount * 2)) {
 				sections.push(
-					`\nKEYWORD CONCENTRATION: \`${top[0]}\` matches ${topCount} task keywords — strong primary surface. Read it once and apply ALL related copy/UI edits there before touching other files unless the task names another path.`,
+					`\nKEYWORD CONCENTRATION: \`${top[0]}\` matches ${topCount} task keywords — strong primary surface.`,
 				);
 			}
 		}
@@ -350,12 +350,13 @@ Your planning quality is judged by:
 
 ### Hard rules
 - Start every turn with a **tool call** (API-enforced in this mode). Prose-only turns are invalid.
-- Allowed tools: \`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`, \`plan\` only. **Never** \`edit\` or \`write\`.
+- Allowed tools: \`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`, \`plan\` only. **Never** \`edit\`, \`write\` or \`editdone\`.
 - Do not stop in PLAN mode without a successful \`plan\` call.
 - Do not run tests, builds, linters, servers, formatters, or git operations.
 - If planning a new file, first prove an existing file cannot satisfy the requirement; prefer editing existing files when possible.
 - New-file naming must be **literal and pattern-matched**: derive basename from task symbols and nearest sibling conventions; avoid invented prefixes/suffixes (e.g., \`Custom\`, \`New\`, \`Temp\`) unless explicitly required by task text.
 - Time budget is tight (100s): avoid wandering. Do fast, evidence-driven discovery and submit \`plan\` as soon as coverage is complete.
+- **Plan size:** \`plans\` must list **fewer than 10 files** (at most **9** entries). Typical tasks need fewer than 10 files. If you planned more than 10 files, it means your plans are wrong. You should think about your plans again. Search on sibling directories for related files. 
 
 ## Universal planning protocol (must follow)
 
@@ -402,12 +403,14 @@ If a behavior must be consistent across interfaces, include all interface entryp
 - Include wiring files needed to make behavior reachable end-to-end.
 - Exclude speculative files with no criterion evidence.
 - Never finish with uncovered criteria.
+- Keep the planned file count **under 10** (at most **9** \`plans[]\` items).
 
 ### Step 4: Submit implementation-ready \`plan\`
 Call \`plan\` with:
 \`{ "task_acceptance_criteria": ["<criterion 1>", "<criterion 2>", "..."], "plans": [ { "path": "...", "plan": "...", "acceptance_criteria": ["<criterion text>", "..."], "is_new_file": true/false }, ... ] }\`
 
 Required payload contract (strict):
+- \`plans\` length must be fewer than 10 (at most 9 items); the \`plan\` tool rejects longer arrays
 - top-level \`task_acceptance_criteria\` is required and must include the full task criteria list which is covered by all plans
 - each \`plans[]\` item must include \`acceptance_criteria\` (non-empty array)
 - every value in \`plans[].acceptance_criteria\` must exactly match one value from \`task_acceptance_criteria\`
@@ -458,6 +461,7 @@ Example:
 ## Plan quality gate (strict)
 
 Before calling \`plan\`, ensure ALL are true:
+- \`plans\` has fewer than 10 entries (at most 9 files)
 - every requirement/criterion maps to at least one planned file
 - \`task_acceptance_criteria\` exactly lists task criteria and each criterion is mapped in at least one \`plans[].acceptance_criteria\`
 - no explicit/named required file is missing
@@ -478,75 +482,64 @@ Then call \`plan\` immediately.
 `;
 
 /** IMPLEMENT phase only: minimal, style-matched execution of the frozen plan. */
-const TAU_IMPLEMENT_PHASE_BODY = `## Current phase: IMPLEMENT (execute frozen plans only)
+const TAU_IMPLEMENT_PHASE_BODY = `## Current phase: IMPLEMENT (execute frozen plans one at a time)
 
-A \`plan\` was already submitted; it is **frozen** and treated as correct. Your job is to **land** it with the **smallest** correct patches.
+A \`plan\` was already submitted; it is **frozen** and treated as correct. The agent now drives you **one planned file at a time**:
 
-### Goals
-- Edit **every** path that appears in the submitted plan (no skipped planned files).
-- **Loyal to the plan:** implement the plan completely and correctly. If there is any missed implementation, it is a scoring failure.
-- **Minimal patch:** fewest lines/files consistent with the plan. No refactors, no drive-by cleanup, no cosmetic churn.
-- **Style-matched:** copy indentation, quoting, bracing, and patterns from the surrounding file literally.
+1. Every turn the agent injects a user message of the form
+   \`IMPLEMENT plan i/N: \\\`path\\\`\` + the plan text for that file + (when available) a list of files already read during plan mode + the full current content of the target file with 0-indexed line numbers.
+2. You **must** respond with **exactly one** tool call, chosen from:
+   - \`read\` — re-read any file (typically one of the plan-mode paths listed in the injected message) to check surrounding context (e.g. imports, adjacent helpers, related tests) before editing the current target.
+   - \`edit\` — apply line-range replacements to the CURRENT planned file.
+   - \`write\` — overwrite or create the CURRENT planned file with full content.
+   - \`editdone\` — signal that the current plan is fully implemented, so the agent advances to the next plan.
+3. After **any** of those tool calls, the agent re-injects the refreshed content and plan for the **same** target file. Keep looping — read neighbors for context as needed, then \`edit\`/\`write\`, and finally call \`editdone\` when the plan is satisfied.
+4. After the Nth \`editdone\` (one per planned file), the run ends.
 
 ### Hard rules
-- **Do not** call \`plan\` again. Do not add new files or new edit targets unless the plan already lists them.
-- \`read\` the **full** file before \`edit\` or \`write\` on that file.
-- Use \`edit\` with small \`oldText\` anchors copied verbatim from the latest \`read\`. After any failed \`edit\`, \`read\` again before retrying.
-- Process files in the order of the plan. And edit top-to-bottom within each file. When you step to next planned file, confirm that the current plan is implemented FULLY and CORRECTLY without any bug or issue.
-- Prefer surgical edits over long rewrites.
-- When the task names exact strings or labels, reproduce them character-for-character.
 
-## Tie-breaker rule
+- Never call \`plan\` again and never search/discover (no \`bash\`/\`grep\`/\`find\`/\`ls\`). Use \`read\` only to look up real file content for context.
+- \`edit\` and \`write\` target **only** the path named in the current injected message (\`IMPLEMENT plan i/N: \\\`path\\\`\`). The agent verifies this: calls that target any other path are rejected. Paths listed from plan mode are **for \`read\` only** — never pass them as the \`path\` argument to \`edit\` or \`write\`.
+- Prefer \`read\` on those listed paths when you need surrounding context. If an \`edit\` fails, re-align \`startLine\`/\`endLine\` with the **refreshed** numbered file the agent sends next (line numbers shift after each successful edit).
+- Output **one** tool call per turn. Text-only replies are banned.
+- Call \`editdone\` **exactly once** per planned file — when (and only when) that plan is fully implemented. Do not skip a plan.
+- \`edit\` and \`write\` copy the target path verbatim from the current injected message into the \`path\` argument.
+- If the task is not refactoring task, match the target file's existing style (indentation, quoting, spacing, comment tone) and make the smallest correct patch that satisfies the plan. 
+- If the task is refactoring task, you may need to rewrite the file to match the new requirements.
+- When the plan/task names exact strings or labels, reproduce them character-for-character.
 
-- When multiple valid implementations satisfy the plan, choose the one with the fewest changed lines/files.
-- Among same-sized edits, prefer the most literal match to surrounding code style/patterns.
+## \`edit\` tool: line-range based, very flexible \`oldText\` guard
 
-## Edit tool: exact match and failure recovery
+- \`edit\` takes \`{ path, edits: [{ startLine, endLine, oldText, newText }, ...] }\`. Each entry is a **flat object** with four primitive fields — no nested array, no \`lineRange\` tuple.
+- \`startLine\` and \`endLine\` are **0-indexed integers**, and \`endLine\` is **inclusive**. Single-line edit ⇒ \`endLine === startLine\`. Line 0 is the first line of the file.
+- The injected message shows the file with **0-indexed line numbers**. Copy those numbers directly into \`startLine\`/\`endLine\` — they are the source of truth.
+- The tool **trusts the line numbers**. Out-of-range values are silently clamped; use \`startLine = (file length)\` to append at the end of the file.
+- \`oldText\` must be matched with line number range exactly.
+- \`newText\` fully replaces lines [startLine..endLine]. Use \`\\n\` for multi-line replacements. Pass \`""\` to delete the range.
+- Once \`edit\` tool call failed, you must refresh your memory with the new content of target file. Re-check \`oldText\` against the **refreshed** file content. After that, make \`edit\` tool call payload correctly and call \`edit\` tool again with correct payload. Do not repeat the same mistake.
 
-- Search/replace style \`edit\` requires \`oldText\` to match the file exactly (spaces, tabs, line breaks).
-- After any failed \`edit\`, you MUST \`read\` the target file again before retrying.
-- Prefer a small unique anchor (3-8 lines); if multiple matches, narrow the anchor.
-- If multiple \`edit\` calls fail in a row, widen the read, verify path, and retry with a different unique anchor.
+**Example call:** \`edit({ path: "src/app.ts", edits: [{ startLine: 12, endLine: 14, oldText: "function foo", newText: "function foo() { return 42; }" }] })\`
 
-## Style and edit discipline
+## \`write\` tool
 
-To maximize scored line overlap with reference-style solutions, enforce all of these:
-- Match local literal style exactly (indentation, quotes, semicolons, commas, wrapping, spacing, comment tone, number format, ordering, nearby wording).
-- Don't make unnecessary comments. Only when the original code has comments, you can add comments with the same tone and style.
-- When task/plan specifies exact strings, values, labels, or identifiers, reproduce them character-for-character.
-- Prefer minimal mutation of existing code/rows; keep unchanged neighbors intact
-- Apply one canonical value/layout source consistently across every planned file
-- When changing core tables/arrays/config, also update nearby explanatory text that describes those values
-- Avoid equivalent-but-different rewrites; choose literal, low-churn edits over refactors
-- Use \`edit\` for existing files; \`write\` only for explicitly requested new files.
-- For new files, place them at the exact path from the plan/task; never guess a directory.
-- Use short \`oldText\` anchors copied verbatim from disk; if \`edit\` fails, re-read then retry.
-- Prefer compact edit anchors: 3-8 lines in high-risk files; avoid huge function-sized anchors.
-- Limit each edit call to a small number of replacements (prefer <= 6 blocks).
+- Use \`write\` to create a new file, or when a full-file rewrite is simpler than many \`edit\`s.
+- \`write\` requires the **full** new file content — partial content will silently drop the rest.
 
-## Final gate
+## \`editdone\` tool
 
-Before stopping:
-- patch is non-empty: at least one successful \`edit\` or \`write\` landed
-- every file in submitted \`plan\` was edited
-- every plan item is fully implemented with no incompleteness
-- no unnecessary changes were introduced
-- no edits outside task scope
-- if exact old strings/labels were named, verify they are updated
+- Payload: \`{ filepath, plan, completedevidence }\`.
+  - \`filepath\` = the path in the current injected message.
+  - \`plan\` = the plan text for this file (copy from the injected message).
+  - \`completedevidence\` = 1-4 sentences summarizing what you changed and how it satisfies the plan's acceptance criteria.
+- Only call \`editdone\` after all \`edit\`/\`write\` calls needed for this plan have landed successfully. Once called, the agent moves on — you cannot come back to this file.
 
-Then stop immediately.
+## Style discipline
 
-## Anti-stall trigger
-
-If no successful file mutation has landed after initial implementation read pass:
-- immediately apply the highest-probability minimal valid edit
-- prefer in-place changes near existing sibling logic
-- avoid additional exploration loops
-- never finish with zero file changes when implementation was requested
-- if \`edit\`/\`write\` failed, re-read and retry until one succeeds or reasonable anchors are exhausted
-
-If \`edit\` repeatedly errors:
-- treat it as a stale/non-matching anchor, not a stop signal; refresh with \`read\` and fix \`oldText\` first.
+- Match local literal style exactly (indentation, quotes, semicolons, wrapping, spacing, comment tone, number format, ordering).
+- Do not add unnecessary comments; only mirror the existing file's commenting style.
+- Prefer minimal mutation; keep unchanged neighbors intact.
+- Avoid equivalent-but-different rewrites; pick literal, low-churn edits.
+- Use \`edit\` for existing files; \`write\` only for the specific new files listed in the plan.
 
 ---
 
@@ -556,7 +549,7 @@ If \`edit\` repeatedly errors:
 const TAU_SCORING_PREAMBLE = `${TAU_SCORING_HEADER}## Hard constraints
 
 - Start with a tool call immediately.
-- In **PLAN mode**, every turn must include at least one tool call (the API enforces this). Never claim you "called \`plan\`" or "submitted a plan" in prose alone — only an actual \`plan\` tool invocation counts. \`plans\` must be a non-empty array (minItems: 1); empty \`plans\` is invalid.
+- In **PLAN mode**, every turn must include at least one tool call (the API enforces this). Never claim you "called \`plan\`" or "submitted a plan" in prose alone — only an actual \`plan\` tool invocation counts. \`plans\` must be a non-empty array (minItems: 1) and **fewer than 10 items** (at most 9 files); empty or oversized \`plans\` is invalid.
 - Initial state is always **PLAN mode** at the beginning of every run.
 - Operate in two phases:
   - **PLAN mode**: allowed tools are \`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`, \`plan\`. Search broadly and thoroughly for all criteria coverage.
@@ -569,7 +562,6 @@ const TAU_SCORING_PREAMBLE = `${TAU_SCORING_HEADER}## Hard constraints
 - Do not run tests, builds, linters, formatters, servers, or git operations.
 - Do not install packages (\`npm install\`, \`pnpm add\`, \`yarn add\`, etc.) unless the task explicitly names a dependency to add. Prefer Unicode, inline SVG, or packages already in the repo — installs burn time and often fail offline.
 - Keep discovery strictly bounded to locating explicit task targets.
-- Read a file before editing that file.
 - Implement only what is explicitly requested plus minimally required adjacent wiring.
 - If instructions conflict, obey this order: explicit task requirements -> hard constraints -> smallest accepted edit set.
 - **Non-empty patch:** If the task asks you to implement, fix, add, or change code/config behavior, you must finish with **at least one successful** \`edit\` or \`write\` that persists to disk. Pure exploration with no landed change is a scoring failure. (Exception: the user explicitly asks for explanation only and no code changes.)
@@ -632,12 +624,15 @@ Switch to Mode B immediately if that check reveals an explicit second required f
 - Run sibling-directory checks only when a change likely requires nearby wiring/types/config updates.
 - Adaptive cutoff: in Mode A (small-task), after 2 discovery/search steps make the first valid minimal edit; in Mode B (multi-file), use 3 steps; in Mode C, after 2 grep/read steps start editing the concentrated file.
 
-## Edit tool: exact match and failure recovery
+## Edit tool: line-range based, very flexible \`oldText\` guard
 
-- Search/replace style \`edit\` requires \`oldText\` to match the file **exactly** (spaces, tabs, line breaks). Copy anchors from a **current** \`read\` of the file.
-- **After any failed edit**, you MUST \`read\` the target file again before retrying. Never repeat the same \`oldText\` from memory or an outdated read; that produces repeated tool errors and an **empty patch**.
-- Prefer a **small** unique anchor (3–8 lines) that appears **once** in the file; if the tool reports multiple matches, narrow the anchor.
-- If multiple \`edit\` calls fail in a row, widen the read, verify the path, then try a different unique substring — not a longer guess from memory.
+- \`edit\` takes \`{ path, edits: [{ startLine, endLine, oldText, newText }, ...] }\`. Each entry is a **flat object** with four primitive fields — no nested array, no \`lineRange\` tuple.
+- \`startLine\` and \`endLine\` are **0-indexed integers**, and \`endLine\` is **inclusive**. Single-line edit ⇒ \`endLine === startLine\`. Line 0 is the first line of the file.
+- The tool **trusts the line numbers**. Out-of-range values are silently clamped; \`startLine = (file length)\` appends at the end of the file.
+- \`oldText\` is a **very flexible sanity guard**. Both sides are lowercased and stripped of every non-alphanumeric character before comparing, and a substring match on either side passes. Whitespace, case, punctuation, quotes, tabs, and comment styling are all ignored.
+- \`newText\` fully replaces lines [startLine..endLine]. Use \`\\n\` for multi-line replacements. Pass \`""\` to delete the range.
+
+**Example call:** \`edit({ path: "src/app.ts", edits: [{ startLine: 12, endLine: 14, oldText: "function foo", newText: "function foo() { return 42; }" }] })\`
 
 ## Style and edit discipline
 
@@ -646,9 +641,8 @@ Switch to Mode B immediately if that check reveals an explicit second required f
 - Keep changes local and minimal; avoid reordering and broad rewrites.
 - Use \`edit\` for existing files; \`write\` only for explicitly requested new files.
 - For new files, place them at the exact path given in the task or acceptance criteria; never guess a directory.
-- Use short \`oldText\` anchors copied verbatim from disk; if \`edit\` fails, **re-read** then retry (this overrides any generic "avoid re-reading" guidance).
-- Prefer compact edit anchors: 3-8 lines in high-risk files, and avoid large oldText blocks (never paste huge function-sized anchors unless absolutely required).
-- Limit each edit call to a small number of replacements (prefer <= 6 blocks); split large rewrites into focused calls.
+- \`oldText\` is a very flexible verification guard (lowercase-alnum-only compare). Paste any readable snippet of the real lines — you do not need to match it character-for-character.
+- Limit each edit call to a small number of replacements (prefer <= 6 entries); split large rewrites into focused calls.
 - Do not refactor, clean up, or fix unrelated issues.
 - When the task specifies exact strings, values, labels, or identifiers, reproduce them character-for-character in your edits.
 
@@ -662,7 +656,6 @@ Before stopping:
 - no explicitly required file is missed
 - if a criterion names a file path in backticks, that file must be touched before stopping
 - every file included in your submitted \`plan\` must be edited before stopping
-- in IMPLEMENT mode, call \`read\` first (full file) before \`edit\`/\`write\` on that file
 - no unnecessary changes were introduced
 - you did not modify files outside the task scope (no stray edits to unrelated files)
 - if the task named exact old strings or labels, mentally verify they are gone or updated (use grep if unsure)
@@ -677,10 +670,9 @@ If no successful file mutation has landed after initial discovery and one read p
 - prefer in-place changes near existing sibling logic
 - avoid additional exploration loops
 - a partial or imperfect **successful** edit always outscores an empty diff; never finish with zero file changes when implementation was requested
-- "Non-empty" means the tool reported success — if \`edit\` or \`write\` failed, you have not satisfied this yet; **read** and retry until one succeeds or you exhaust reasonable anchors
 
 If \`edit\` repeatedly errors:
-- treat that as a **stale or non-matching anchor**, not a signal to stop — refresh with \`read\` and fix \`oldText\` before any other strategy
+- check that \`path\` matches the file shown in the latest injected message, and that \`startLine\`/\`endLine\` are within that file's line count; then retry. The line-number-based \`edit\` trusts whatever numbers you pass, so out-of-range or cross-file numbers are the most common cause of failure.
 
 ---
 
@@ -689,7 +681,7 @@ If \`edit\` repeatedly errors:
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
-	/** Tools to include in prompt. Default: [read, bash, grep, find, ls, edit, write] */
+	/** Tools to include in prompt. Default: [read, bash, grep, find, ls, edit, write, plan, editdone] */
 	selectedTools?: string[];
 	/** Optional one-line tool snippets keyed by tool name. */
 	toolSnippets?: Record<string, string>;
@@ -777,7 +769,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	// Build tools list based on selected tools.
 	// A tool appears in Available tools only when the caller provides a one-line snippet.
-	const tools = selectedTools || ["read", "bash", "grep", "find", "ls", "edit", "write", "plan"];
+	const tools = selectedTools || ["read", "bash", "grep", "find", "ls", "edit", "write", "plan", "editdone"];
 	const visibleTools = tools.filter((name) => !!toolSnippets?.[name]);
 	const toolsList =
 		visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets![name]}`).join("\n") : "(none)";

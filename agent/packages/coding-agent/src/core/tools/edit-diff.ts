@@ -203,6 +203,20 @@ export interface Edit {
 	newText: string;
 }
 
+/**
+ * Line-range based edit (0-indexed, inclusive [firstLine, lastLine]).
+ *
+ * The tool replaces the exact lines at [firstLine..lastLine] with `newText`, using
+ * `oldText` as a verification guard to confirm the model is editing the lines it
+ * thinks it is. `oldText` is compared against the joined content of the targeted
+ * lines with line-ending normalization and trailing-whitespace tolerance.
+ */
+export interface LineRangeEdit {
+	lineRange: [number, number];
+	oldText: string;
+	newText: string;
+}
+
 interface MatchedEdit {
 	editIndex: number;
 	matchIndex: number;
@@ -646,4 +660,123 @@ export async function computeEditDiff(
 	cwd: string,
 ): Promise<EditDiffResult | EditDiffError> {
 	return computeEditsDiff(path, [{ oldText, newText }], cwd);
+}
+
+/**
+ * Project a string to lowercase ASCII alphanumerics ([a-z0-9]).
+ * Everything else (whitespace, punctuation, quotes, operators, case, Unicode) is dropped.
+ * Used for the tolerant `oldText` verification: trust the line range and only
+ * check that the model's `oldText` plausibly refers to the targeted lines.
+ */
+function lowerAlnumProjection(s: string): string {
+	return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Compare the actual lines at a range with the model-provided `oldText`.
+ *
+ * Policy: TRUST the line range. `oldText` is only a very flexible guard —
+ * we project both sides to lowercase-alphanumeric characters only and check
+ * that the oldText projection is a substring of the actual projection (or
+ * vice versa for very short lines). That tolerates all whitespace, case,
+ * punctuation, quotes, comment styling, and Unicode drift.
+ *
+ * Returns ok=true when either projection is empty (fully trusts the range)
+ * or when one projection contains the other.
+ */
+function verifyOldTextAgainstLines(
+	actualLines: string[],
+	expectedOldText: string,
+): { ok: boolean; actual: string } {
+	const actualJoined = actualLines.join("\n");
+	const expectedProj = lowerAlnumProjection(expectedOldText);
+	const actualProj = lowerAlnumProjection(actualJoined);
+
+	if (expectedProj.length === 0 || actualProj.length === 0) {
+		return { ok: true, actual: actualJoined };
+	}
+	if (actualProj.includes(expectedProj) || expectedProj.includes(actualProj)) {
+		return { ok: true, actual: actualJoined };
+	}
+	return { ok: false, actual: actualJoined };
+}
+
+/**
+ * Apply one or more line-range replacements to LF-normalized content.
+ *
+ * Policy: TRUST the model-provided line numbers. We silently clamp any
+ * start/end line that falls outside the file (startLine >= totalLines is
+ * treated as "append at end", endLine > totalLines-1 is clamped). We do not
+ * enforce non-overlapping ranges; overlapping edits are applied in reverse
+ * order of startLine and later-added content simply wins. The only soft
+ * guard is the tolerant lowercase-alphanumeric `oldText` check per entry.
+ */
+export function applyLineRangeEditsToNormalizedContent(
+	normalizedContent: string,
+	edits: LineRangeEdit[],
+	path: string,
+): AppliedEditsResult {
+	const lines = normalizedContent.split("\n");
+	const totalLines = lines.length;
+
+	// Normalize each edit into a safe clamped range. Append-at-end is supported
+	// by passing startLine >= totalLines (range becomes [totalLines, totalLines-1],
+	// which splice treats as pure insertion at the end).
+	type ClampedEdit = {
+		start: number;
+		end: number; // exclusive splice delete-end (end - start = deleteCount)
+		newText: string;
+		oldText: string;
+		idx: number;
+	};
+	const clamped: ClampedEdit[] = [];
+	for (let i = 0; i < edits.length; i++) {
+		const e = edits[i];
+		const rawFirst = Array.isArray(e.lineRange) && Number.isInteger(e.lineRange[0]) ? e.lineRange[0] : 0;
+		const rawLast = Array.isArray(e.lineRange) && Number.isInteger(e.lineRange[1]) ? e.lineRange[1] : rawFirst;
+		const first = Math.max(0, rawFirst);
+		// If the model addresses content past the end, treat as "append at end".
+		let start = Math.min(first, totalLines);
+		let endExclusive: number;
+		if (start >= totalLines) {
+			start = totalLines;
+			endExclusive = totalLines; // pure insertion
+		} else {
+			const last = Math.max(start, Math.min(rawLast, totalLines - 1));
+			endExclusive = last + 1;
+		}
+		clamped.push({
+			start,
+			end: endExclusive,
+			newText: typeof e.newText === "string" ? e.newText : "",
+			oldText: typeof e.oldText === "string" ? e.oldText : "",
+			idx: i,
+		});
+	}
+
+	// Soft oldText verification (the only remaining guard).
+	for (const c of clamped) {
+		if (c.end <= c.start) continue; // pure insertion — no content to verify
+		const slice = lines.slice(c.start, c.end);
+		const check = verifyOldTextAgainstLines(slice, c.oldText);
+		if (!check.ok) {
+			const prefix = clamped.length === 1 ? "" : `edits[${c.idx}] `;
+			throw new Error(
+				`${prefix}oldText does not match the actual content of lines ${c.start}-${c.end - 1} in ${path}.\n` +
+					`--- Your oldText ---\n${c.oldText}\n` +
+					`--- Actual file content at lines ${c.start}-${c.end - 1} ---\n${check.actual}`,
+			);
+		}
+	}
+
+	// Apply in reverse order of start so earlier indices stay stable.
+	const newLines = lines.slice();
+	const applyOrder = clamped.slice().sort((a, b) => b.start - a.start || b.end - a.end);
+	for (const c of applyOrder) {
+		const replacement = normalizeToLF(c.newText).split("\n");
+		newLines.splice(c.start, c.end - c.start, ...replacement);
+	}
+
+	const newContent = newLines.join("\n");
+	return { baseContent: normalizedContent, newContent };
 }

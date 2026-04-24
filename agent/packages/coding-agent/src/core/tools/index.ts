@@ -21,6 +21,14 @@ export {
 	editTool,
 	editToolDefinition,
 } from "./edit.js";
+export {
+	createEditDoneTool,
+	createEditDoneToolDefinition,
+	type EditDoneToolDetails,
+	type EditDoneToolInput,
+	editdoneTool,
+	editdoneToolDefinition,
+} from "./editdone.js";
 export { withFileMutationQueue } from "./file-mutation-queue.js";
 export {
 	createFindTool,
@@ -100,6 +108,12 @@ import {
 	createBashToolDefinition,
 } from "./bash.js";
 import { createEditTool, createEditToolDefinition, editTool, editToolDefinition } from "./edit.js";
+import {
+	createEditDoneTool,
+	createEditDoneToolDefinition,
+	editdoneTool,
+	editdoneToolDefinition,
+} from "./editdone.js";
 import { createFindTool, createFindToolDefinition, findTool, findToolDefinition } from "./find.js";
 import { createGrepTool, createGrepToolDefinition, grepTool, grepToolDefinition } from "./grep.js";
 import { createLsTool, createLsToolDefinition, lsTool, lsToolDefinition } from "./ls.js";
@@ -116,7 +130,7 @@ import { createWriteTool, createWriteToolDefinition, writeTool, writeToolDefinit
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
 
-export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool, planTool];
+export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool, planTool, editdoneTool];
 export const readOnlyTools: Tool[] = [readTool, grepTool, findTool, lsTool];
 
 export const allTools = {
@@ -128,6 +142,7 @@ export const allTools = {
 	find: findTool,
 	ls: lsTool,
 	plan: planTool,
+	editdone: editdoneTool,
 };
 
 export const allToolDefinitions = {
@@ -139,6 +154,7 @@ export const allToolDefinitions = {
 	find: findToolDefinition,
 	ls: lsToolDefinition,
 	plan: planToolDefinition,
+	editdone: editdoneToolDefinition,
 };
 
 export type ToolName = keyof typeof allTools;
@@ -155,6 +171,7 @@ export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions)
 		createEditToolDefinition(cwd),
 		createWriteToolDefinition(cwd),
 		createPlanToolDefinition(),
+		createEditDoneToolDefinition(),
 	];
 }
 
@@ -177,6 +194,7 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		find: createFindToolDefinition(cwd),
 		ls: createLsToolDefinition(cwd),
 		plan: createPlanToolDefinition(),
+		editdone: createEditDoneToolDefinition(),
 	};
 }
 
@@ -187,6 +205,7 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 		createEditTool(cwd),
 		createWriteTool(cwd),
 		createPlanTool(),
+		createEditDoneTool(),
 	];
 }
 
@@ -204,5 +223,6 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		find: createFindTool(cwd),
 		ls: createLsTool(cwd),
 		plan: createPlanTool(),
+		editdone: createEditDoneTool(),
 	};
 }

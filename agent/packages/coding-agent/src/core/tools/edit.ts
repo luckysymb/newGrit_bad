@@ -6,11 +6,10 @@ import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } 
 import { renderDiff } from "../../modes/interactive/components/diff.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import {
-	applyEditsToNormalizedContent,
+	applyLineRangeEditsToNormalizedContent,
 	detectLineEnding,
-	type Edit,
-	fuzzyFindText,
 	generateDiffString,
+	type LineRangeEdit,
 	normalizeToLF,
 	restoreLineEndings,
 	stripBom,
@@ -22,13 +21,38 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 type EditRenderState = Record<string, never>;
 
+/**
+ * Line-range based replacement. The model specifies WHICH lines to replace
+ * (by 0-indexed inclusive startLine/endLine) and WHAT to replace them with.
+ * `oldText` is used as a coarse verification guard: the tool reads the real
+ * lines at [startLine..endLine] and compares the alphanumeric projection with
+ * `oldText` before doing the replacement.
+ *
+ * The schema is intentionally FLAT (no nested tuple array). Flat primitive
+ * fields are what providers (Gemini, OpenAI, Anthropic) emit most reliably
+ * inside an array of objects; nested tuple schemas cause some providers to
+ * return `edits: []` and give up entirely.
+ */
 const replaceEditSchema = Type.Object(
 	{
+		startLine: Type.Integer({
+			minimum: 0,
+			description:
+				"Zero-indexed INCLUSIVE first line of the range to replace. Line 0 is the first line of the file. Refers to the ORIGINAL file content (before any edit in this call is applied).",
+		}),
+		endLine: Type.Integer({
+			minimum: 0,
+			description:
+				"Zero-indexed INCLUSIVE last line of the range to replace. For a single-line edit set endLine equal to startLine. Refers to the ORIGINAL file content.",
+		}),
 		oldText: Type.String({
 			description:
-				"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
+				"The ACTUAL current text of lines [startLine..endLine] INCLUSIVE, joined by \\n, COPIED VERBATIM from a fresh `read` of the file. Used as a verification guard — the tool compares ONLY alphanumeric characters ([a-zA-Z0-9]) between oldText and the real lines, so whitespace, indentation, punctuation, quotes, and trailing newlines do NOT need to match exactly. Do NOT send an empty string, a single space, or a placeholder — always copy the real content of every line in the range. To insert new content without removing anything, include the original target line in both `oldText` and `newText` (prepending/appending your addition inside `newText`).",
 		}),
-		newText: Type.String({ description: "Replacement text for this targeted edit." }),
+		newText: Type.String({
+			description:
+				"Replacement text for lines [startLine..endLine]. May contain multiple lines (use \\n). Pass an empty string to delete the range.",
+		}),
 	},
 	{ additionalProperties: false },
 );
@@ -38,17 +62,13 @@ const editSchema = Type.Object(
 		path: Type.String({ description: "Path to the file to edit (relative or absolute)" }),
 		edits: Type.Array(replaceEditSchema, {
 			description:
-				"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+				"One or more line-range replacements. Each entry has {startLine, endLine, oldText, newText} as flat fields (no nested array). All startLine/endLine values refer to the ORIGINAL file. Ranges must be non-overlapping. The tool applies them in reverse order so earlier line numbers stay valid.",
 		}),
 	},
 	{ additionalProperties: false },
 );
 
 export type EditToolInput = Static<typeof editSchema>;
-type LegacyEditToolInput = EditToolInput & {
-	oldText?: unknown;
-	newText?: unknown;
-};
 
 export interface EditToolDetails {
 	/** Unified diff of the changes made */
@@ -81,13 +101,65 @@ export interface EditToolOptions {
 	operations?: EditOperations;
 }
 
-function isValidEditPair(o: unknown): o is { oldText: string; newText: string } {
-	if (!o || typeof o !== "object") return false;
-	const e = o as Record<string, unknown>;
-	if (typeof e.oldText !== "string" || typeof e.newText !== "string") return false;
-	// Empty oldText always fails apply; drop so other valid edits in the same call can run.
-	if (e.oldText.length === 0) return false;
-	return true;
+/**
+ * Prepared entries use the SAME shape as the public schema
+ * ({ startLine, endLine, oldText, newText }) so that the wrapper's JSON-schema
+ * validator accepts them. Internal conversion to LineRangeEdit happens later
+ * inside `validateEditInput`, which runs after schema validation.
+ */
+type PreparedEditEntry = {
+	startLine: number;
+	endLine: number;
+	oldText: string;
+	newText: string;
+};
+
+function isFiniteInt(n: unknown): n is number {
+	return typeof n === "number" && Number.isInteger(n) && Number.isFinite(n);
+}
+
+function coerceLineRange(value: unknown): [number, number] | null {
+	if (!Array.isArray(value) || value.length !== 2) return null;
+	const first = value[0];
+	const last = value[1];
+	if (!isFiniteInt(first) || !isFiniteInt(last)) return null;
+	if (first < 0 || last < first) return null;
+	return [first, last];
+}
+
+/**
+ * Extract [startLine, endLine] from a raw edit entry, accepting several aliases
+ * so that providers with different schema-filling styles still succeed:
+ *   - Preferred flat form: { startLine, endLine }
+ *   - Tuple form:          { lineRange: [start, end] }
+ *   - Snake_case:          { start_line, end_line }
+ *   - firstLine/lastLine:  { firstLine, lastLine } / { first_line, last_line }
+ */
+function extractLineRange(r: Record<string, unknown>): [number, number] | null {
+	const pairs: Array<[unknown, unknown]> = [
+		[r.startLine, r.endLine],
+		[r.start_line, r.end_line],
+		[r.firstLine, r.lastLine],
+		[r.first_line, r.last_line],
+	];
+	for (const [a, b] of pairs) {
+		if (isFiniteInt(a) && isFiniteInt(b) && a >= 0 && b >= a) {
+			return [a, b];
+		}
+	}
+	const tuple = coerceLineRange(r.lineRange);
+	if (tuple) return tuple;
+	return null;
+}
+
+function coerceEditEntry(raw: unknown): PreparedEditEntry | null {
+	if (!raw || typeof raw !== "object") return null;
+	const r = raw as Record<string, unknown>;
+	const range = extractLineRange(r);
+	if (!range) return null;
+	if (typeof r.oldText !== "string") return null;
+	if (typeof r.newText !== "string") return null;
+	return { startLine: range[0], endLine: range[1], oldText: r.oldText, newText: r.newText };
 }
 
 function pickEditPath(args: { path?: unknown; file_path?: unknown }): string | undefined {
@@ -111,19 +183,37 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		return input as EditToolInput;
 	}
 
-	const args = input as LegacyEditToolInput & { file_path?: unknown; edits?: unknown[] };
-	const collected: Array<{ oldText: string; newText: string }> = [];
+	const args = input as {
+		path?: unknown;
+		file_path?: unknown;
+		edits?: unknown[];
+		startLine?: unknown;
+		endLine?: unknown;
+		lineRange?: unknown;
+		oldText?: unknown;
+		newText?: unknown;
+	};
+	const collected: PreparedEditEntry[] = [];
 
 	if (Array.isArray(args.edits)) {
 		for (const entry of args.edits) {
-			if (isValidEditPair(entry)) {
-				collected.push({ oldText: entry.oldText, newText: entry.newText });
-			}
+			const e = coerceEditEntry(entry);
+			if (e) collected.push(e);
 		}
 	}
 
-	if (typeof args.oldText === "string" && typeof args.newText === "string" && args.oldText.length > 0) {
-		collected.push({ oldText: args.oldText, newText: args.newText });
+	// Tolerate a flat top-level shape too: { startLine, endLine, oldText, newText }
+	// (or any of the aliases supported by extractLineRange).
+	if (typeof args.oldText === "string" && typeof args.newText === "string") {
+		const topRange = extractLineRange(args as Record<string, unknown>);
+		if (topRange) {
+			collected.push({
+				startLine: topRange[0],
+				endLine: topRange[1],
+				oldText: args.oldText,
+				newText: args.newText,
+			});
+		}
 	}
 
 	if (collected.length === 0) {
@@ -135,95 +225,34 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		return input as EditToolInput;
 	}
 
-	return { path, edits: collected } as EditToolInput;
+	return { path, edits: collected } as unknown as EditToolInput;
 }
 
-function validateEditInput(input: EditToolInput): { path: string; edits: Edit[] } {
+function validateEditInput(input: EditToolInput): { path: string; edits: LineRangeEdit[] } {
 	if (!Array.isArray(input.edits) || input.edits.length === 0) {
 		throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
 	}
-	return { path: input.path, edits: input.edits };
-}
-
-function extractFailedEditIndex(message: string): number | null {
-	const m = message.match(/edits\[(\d+)\]/);
-	if (!m) return null;
-	const n = Number.parseInt(m[1], 10);
-	return Number.isFinite(n) ? n : null;
-}
-
-/**
- * Multi-edit calls are all-or-nothing by default. When one anchor drifts (common with large model edits),
- * salvage the call by keeping only edits that individually match against the original content.
- */
-function tryApplyEditsWithSalvage(
-	normalizedContent: string,
-	edits: Edit[],
-	path: string,
-): {
-	baseContent: string;
-	newContent: string;
-	appliedCount: number;
-	skippedCount: number;
-	alreadyAppliedCount: number;
-} {
-	try {
-		const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
-		return { baseContent, newContent, appliedCount: edits.length, skippedCount: 0, alreadyAppliedCount: 0 };
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		const failedIndex = extractFailedEditIndex(message);
-		if (edits.length <= 1 || failedIndex === null || !message.includes("Could not find")) {
-			throw error;
-		}
-
-		const validEdits: Edit[] = [];
-		let alreadyAppliedCount = 0;
-		for (let i = 0; i < edits.length; i++) {
-			const candidate = edits[i];
-			try {
-				// Probe each edit in isolation against the original content.
-				applyEditsToNormalizedContent(normalizedContent, [candidate], path);
-				validEdits.push(candidate);
-			} catch {
-				const oldMatch = fuzzyFindText(normalizedContent, normalizeToLF(candidate.oldText)).found;
-				const newMatch = fuzzyFindText(normalizedContent, normalizeToLF(candidate.newText)).found;
-				const oldEqNew = normalizeToLF(candidate.oldText) === normalizeToLF(candidate.newText);
-				if (!oldEqNew && !oldMatch && newMatch) {
-					alreadyAppliedCount++;
-				}
-			}
-		}
-		if (validEdits.length === 0 && alreadyAppliedCount === 0) {
-			throw error;
-		}
-		if (validEdits.length === 0) {
-			// Fully idempotent replay: requested changes are already present on disk.
-			return {
-				baseContent: normalizedContent,
-				newContent: normalizedContent,
-				appliedCount: 0,
-				skippedCount: edits.length - alreadyAppliedCount,
-				alreadyAppliedCount,
-			};
-		}
-		const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, validEdits, path);
-		return {
-			baseContent,
-			newContent,
-			appliedCount: validEdits.length,
-			skippedCount: edits.length - validEdits.length,
-			alreadyAppliedCount,
-		};
+	const normalized: LineRangeEdit[] = [];
+	for (let i = 0; i < input.edits.length; i++) {
+		const entry = input.edits[i] as unknown as Record<string, unknown>;
+		const range = extractLineRange(entry ?? {}) ?? [0, 0];
+		const oldText = typeof entry?.oldText === "string" ? (entry.oldText as string) : "";
+		const newText = typeof entry?.newText === "string" ? (entry.newText as string) : "";
+		normalized.push({ lineRange: range, oldText, newText });
 	}
+	return { path: input.path, edits: normalized };
 }
 
 type RenderableEditArgs = {
 	path?: string;
 	file_path?: string;
-	edits?: Edit[];
-	oldText?: string;
-	newText?: string;
+	edits?: Array<{
+		startLine?: number;
+		endLine?: number;
+		lineRange?: number[];
+		oldText?: string;
+		newText?: string;
+	}>;
 };
 
 function formatEditCall(
@@ -274,14 +303,13 @@ export function createEditToolDefinition(
 		name: "edit",
 		label: "edit",
 		description:
-			"Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+			"Edit a file by REPLACING a zero-indexed inclusive line range [startLine..endLine] with newText. Each entry in `edits` is a flat object {startLine, endLine, oldText, newText}. The tool TRUSTS the line numbers — out-of-range values are silently clamped (use startLine >= file length to append). oldText is the only guard: always copy the real content of every line in the range.",
 		promptSnippet:
-			"Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+			"Replace file lines by zero-indexed inclusive {startLine,endLine}; oldText is a flexible lowercase-alnum sanity guard.",
 		promptGuidelines: [
-			"Use edit for precise changes (edits[].oldText must match exactly)",
-			"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+			"Line numbers are 0-indexed and endLine is INCLUSIVE. Single line: endLine = startLine.",
+			"oldText is the only guard. Do NOT send an empty string, a single space, or a placeholder — always copy the real content of every line in the range.",
+			"Pass newText=\"\" to delete a range. To append at end of file, use startLine = (file length).",
 		],
 		parameters: editSchema,
 		prepareArguments: prepareEditArguments,
@@ -297,7 +325,6 @@ export function createEditToolDefinition(
 						content: Array<{ type: "text"; text: string }>;
 						details: EditToolDetails | undefined;
 					}>((resolve, reject) => {
-						// Check if already aborted.
 						if (signal?.aborted) {
 							reject(new Error("Operation aborted"));
 							return;
@@ -305,7 +332,6 @@ export function createEditToolDefinition(
 
 						let aborted = false;
 
-						// Set up abort handler.
 						const onAbort = () => {
 							aborted = true;
 							reject(new Error("Operation aborted"));
@@ -315,10 +341,8 @@ export function createEditToolDefinition(
 							signal.addEventListener("abort", onAbort, { once: true });
 						}
 
-						// Perform the edit operation.
 						void (async () => {
 							try {
-								// Check if file exists.
 								try {
 									await ops.access(absolutePath);
 								} catch {
@@ -329,32 +353,27 @@ export function createEditToolDefinition(
 									return;
 								}
 
-								// Check if aborted before reading.
 								if (aborted) {
 									return;
 								}
 
-								// Read the file.
 								const buffer = await ops.readFile(absolutePath);
 								const rawContent = buffer.toString("utf-8");
 
-								// Check if aborted after reading.
 								if (aborted) {
 									return;
 								}
 
-								// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 								const { bom, text: content } = stripBom(rawContent);
 								const originalEnding = detectLineEnding(content);
 								const normalizedContent = normalizeToLF(content);
-								const { baseContent, newContent, appliedCount, skippedCount, alreadyAppliedCount } =
-									tryApplyEditsWithSalvage(
+
+								const { baseContent, newContent } = applyLineRangeEditsToNormalizedContent(
 									normalizedContent,
 									edits,
 									resolvedPath,
 								);
 
-								// Check if aborted before writing.
 								if (aborted) {
 									return;
 								}
@@ -365,23 +384,19 @@ export function createEditToolDefinition(
 									await ops.writeFile(absolutePath, finalContent);
 								}
 
-								// Check if aborted after writing.
 								if (aborted) {
 									return;
 								}
 
-								// Clean up abort handler.
 								if (signal) {
 									signal.removeEventListener("abort", onAbort);
 								}
 
 								const diffResult = generateDiffString(baseContent, newContent);
-								const summary =
-									!changed && alreadyAppliedCount > 0
-										? `No-op: ${alreadyAppliedCount}/${edits.length} block(s) already applied in ${resolvedPath}.`
-										: skippedCount > 0
-											? `Partially applied ${appliedCount}/${edits.length} block(s) in ${resolvedPath}. ${skippedCount} block(s) were skipped due to stale/non-matching oldText.`
-											: `Successfully replaced ${appliedCount} block(s) in ${resolvedPath}.`;
+								const rangeSummary = edits
+									.map((e) => `[${e.lineRange[0]}-${e.lineRange[1]}]`)
+									.join(", ");
+								const summary = `Successfully replaced ${edits.length} line range(s) ${rangeSummary} in ${resolvedPath}.`;
 								resolve({
 									content: [
 										{
@@ -392,7 +407,6 @@ export function createEditToolDefinition(
 									details: { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine },
 								});
 							} catch (error: unknown) {
-								// Clean up abort handler.
 								if (signal) {
 									signal.removeEventListener("abort", onAbort);
 								}
