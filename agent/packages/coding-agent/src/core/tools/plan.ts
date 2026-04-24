@@ -139,10 +139,11 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 		name: "plan",
 		label: "plan",
 		description:
-			`Submit final PLAN->IMPLEMENT handoff JSON. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. \`plans\` must be non-empty and have fewer than 10 items (at most ${MAX_PLAN_ITEMS}); each item must include all keys.`,
+			`Submit PLAN->IMPLEMENT handoff JSON. Agent handshake: the **first** assistant turn that contains **only** this \`plan\` tool is a **draft** — the agent echoes your payload with a self-audit prompt and **does not** run validation yet. If you call **any** other tool on a later turn, that resets the handshake. The **second** assistant turn that contains **only** \`plan\` again runs full validation and may transition to IMPLEMENT. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. \`plans\` must be non-empty and have fewer than 10 items (at most ${MAX_PLAN_ITEMS}); each item must include all keys. The order of \`plans\` is load-bearing: implement mode iterates them sequentially and drops per-plan context after each one finishes, so submit them in dependency order (new leaf files first, consumers next, wiring/registration last).`,
 		promptSnippet:
-			"Call plan with exact JSON interface: { task_acceptance_criteria: [...], plans: [{ path, plan, acceptance_criteria, is_new_file }] }",
+			"Call plan with exact JSON interface: { task_acceptance_criteria: [...], plans: [{ path, plan, acceptance_criteria, is_new_file }] }. Order plans in dependency order — leaf files first, wiring last.",
 		promptGuidelines: [
+			"Two-step handshake: first `plan`-only turn = draft echo (no validation). Any turn with a non-`plan` tool resets the handshake. Second consecutive `plan`-only turn = validated commit to IMPLEMENT.",
 			"Call plan only after broad and thorough exploration in plan mode",
 			`Submit fewer than 10 plan entries (at most ${MAX_PLAN_ITEMS} files). If you planned more than 10 files, it means your plans are wrong and you searched only a few files. Search more files on sibling directories for related files.`,
 			"Include every target file needed to satisfy all acceptance criteria",
@@ -152,6 +153,8 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 			"When creating new files, use literal task/symbol names and nearest sibling naming patterns; avoid invented prefixes/suffixes unless explicitly requested",
 			"Each plan item must be implementation-ready and include sections: Scope:, Edits:, Acceptance:, Verification:",
 			"Set is_new_file=false for existing files and true only for files that must be newly created (basename must not already exist anywhere in the repo)",
+			"Order plans in DEPENDENCY ORDER (bottom-up / leaf-first): plans[] is executed sequentially and the agent drops per-plan context after each editdone, so later plans only see files on disk after earlier plans landed. Submit new leaf files (interfaces, DTOs, helpers) first, logic that uses them next, and wiring/registration/delegation last. If plan B references a symbol introduced by plan A, A must come before B.",
+			"Self-check ordering: for every prefix plans[0..N-1], every symbol referenced by those plans must already exist (either in the pre-existing repo or introduced by one of those earlier plans). If not, reorder.",
 		],
 		parameters: planSchema,
 		prepareArguments: normalizePlanArgs,
@@ -255,7 +258,7 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 				for (const c of item.acceptance_criteria) coveredCriteria.add(c);
 			}
 			const uncoveredCriteriaCount = Math.max(0, normalizedTaskCriteria.length - coveredCriteria.size);
-			const criteriaAllCovered = coveredCriteria.size === normalizedTaskCriteria.length;
+			const criteriaAllCovered = coveredCriteria.size >= normalizedTaskCriteria.length;
 			const uncoveredCriteria: string[] = uncoveredCriteriaCount > 0
 				? [`count_mismatch: expected ${normalizedTaskCriteria.length}, covered ${coveredCriteria.size}`]
 				: [];

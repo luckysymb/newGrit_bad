@@ -27,8 +27,8 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
-/** Large cap so typical repo files are included in full; extreme files still truncate to protect memory. */
-const GEMINI_EDIT_RECOVERY_MAX_CHARS = 8_000_000;
+/** Cap echoed JSON in the plan draft handshake so one pathological payload cannot blow the context window. */
+const PLAN_DRAFT_ECHO_JSON_MAX_CHARS = 100_000;
 
 /** True if `candidate` is the workspace root or a path strictly inside it (handles Windows drives). */
 function isPathInsideWorkspaceRoot(root: string, candidate: string): boolean {
@@ -513,6 +513,13 @@ async function runLoop(
 	let executionMode: "plan" | "implement" = "plan";
 	let planSubmitted = false;
 	/**
+	 * Plan handshake: first **plan-only** turn echoes the payload without running
+	 * repository/criteria validation. Any turn that includes a non-`plan` tool
+	 * resets this flag. A later **plan-only** turn (with this flag true) runs
+	 * the real `plan` tool and, if it passes, transitions to IMPLEMENT.
+	 */
+	let planHandshakeAwaitingConsecutivePlanOnly = false;
+	/**
 	 * Ultimate wall-clock time limit for the whole run (measured from loopStart).
 	 * When this is hit we end the run *successfully* even if not every plan is
 	 * finished. It exists so we always return a partial patch before the outer
@@ -889,6 +896,173 @@ async function runLoop(
 		if (!raw || typeof raw !== "object") return [];
 		const obj = raw as { plans?: unknown };
 		return Array.isArray(obj.plans) ? (obj.plans as Array<{ path?: string; plan?: string; acceptance_criteria?: string[] }>) : [];
+	};
+
+	const buildPlanDraftEchoAgentResult = (rawArgs: unknown): AgentToolResult<{ planDraftEcho: true }> => {
+		const collectOfficialTaskAcceptanceCriteriaLines = (): string[] => {
+			const out: string[] = [];
+			const seen = new Set<string>();
+			const pushUnique = (lines: Iterable<string>) => {
+				for (const raw of lines) {
+					const t = raw.trim();
+					if (t.length === 0 || seen.has(t)) continue;
+					seen.add(t);
+					out.push(t);
+				}
+			};
+			pushUnique(acceptanceCriteria.map((c) => c.text));
+			if (out.length === 0) {
+				pushUnique(parseAcceptanceCriteriaBullets(systemPromptText));
+			}
+			const planPhasePrompt = currentContext.tauSystemPrompts?.plan;
+			if (out.length === 0 && typeof planPhasePrompt === "string" && planPhasePrompt.length > 0) {
+				pushUnique(parseAcceptanceCriteriaBullets(planPhasePrompt));
+			}
+			return out;
+		};
+		const officialCriteriaLines = collectOfficialTaskAcceptanceCriteriaLines();
+		const plansArr = extractPlanItems(rawArgs);
+		let appendix = "";
+		try {
+			const rawJson = JSON.stringify(rawArgs, null, 2);
+			appendix =
+				rawJson.length > PLAN_DRAFT_ECHO_JSON_MAX_CHARS
+					? `${rawJson.slice(0, PLAN_DRAFT_ECHO_JSON_MAX_CHARS)}\n…(truncated)…`
+					: rawJson;
+		} catch {
+			appendix = "(could not stringify plan payload)";
+		}
+		const planBlocks = plansArr.map((p, idx) => {
+			const pathText = typeof p?.path === "string" ? p.path.trim() : "(missing path)";
+			const ac = Array.isArray(p?.acceptance_criteria)
+				? p.acceptance_criteria.filter((c): c is string => typeof c === "string" && c.trim().length > 0)
+				: [];
+			const body = typeof p?.plan === "string" ? p.plan.trim() : "";
+			return (
+				`#### Plan item ${idx + 1}: \`${pathText}\`\n` +
+				(ac.length > 0 ? `Linked acceptance_criteria:\n${ac.map((c) => `- ${c}`).join("\n")}\n\n` : "") +
+				`${body || "(empty plan text)"}\n`
+			);
+		});
+		const officialCriteriaBlock =
+			officialCriteriaLines.length > 0
+				? officialCriteriaLines.map((c, i) => `${i + 1}. ${c}`).join("\n")
+				: "(The agent could not extract a bullet list under an **Acceptance criteria:** section from the task / system prompt. Treat the task message you were given as the source of truth: copy its criteria **verbatim** into your next `plan` payload and map every one to a file plan.)";
+		const text =
+			`## PLAN MODE — DRAFT HANDSHAKE (NOT validated)\n\n` +
+			`Your \`plan\` tool call was received. **The agent did not run path checks, file existence checks, or acceptance-criteria validation on this submission.**\n\n` +
+			`This is intentional: your first job is to **brutally self-audit** your draft against the **official** task acceptance criteria below (from the injected task / system prompt — **not** taken from your tool arguments). Do not trust the strings you put in \`task_acceptance_criteria\` until they match this list **exactly**.\n\n` +
+			`### IMPLEMENT-mode contract (non-negotiable — read as law)\n` +
+			`After your **validated** second \`plan\`-only submission, the agent enters **IMPLEMENT** mode. There you must **complete every official acceptance criterion** using **only** what is already frozen in your plans — **not** by treating implement mode as a second discovery pass.\n\n` +
+			`- **No “research to finish the spec”:** You must **not** depend on exploratory \`grep\`, broad \`read\` sweeps, or guessing owners/symbols to figure out what the task meant. Anything required to pass a criterion must already appear in the matching \`plans[].plan\` (**Scope / Edits / Acceptance / Verification**).\n` +
+			`- **Reads are local glue only:** In implement mode, \`read\` exists only to refresh exact file text or skim **already-scoped** neighbors (imports, small helpers) for the **current** planned file — **not** to replace missing \`Edits:\` detail you should have written here in PLAN mode.\n` +
+			`- **Every \`Edits:\` bullet is an executable contract:** Each bullet must be **self-contained**: a competent engineer (or another LLM) can perform that edit **without opening unrelated files to infer intent**. Name **concrete** types, methods, fields, routes, HTTP status codes, JSON property names, zip glob patterns, directories, and before→after behavior.\n` +
+			`- **Ban vague edit language:** Phrases like “wire up appropriately”, “ensure authentication works”, “handle errors”, “update as needed”, “integrate with the system”, or “add support for X” **without** naming the exact symbol and change are **forbidden** — rewrite into precise mechanical steps.\n\n` +
+			`### OFFICIAL task acceptance criteria (from the task)\n${officialCriteriaBlock}\n\n` +
+			`### Mandatory self-review (answer internally with YES/NO — any NO means you are NOT ready to commit)\n` +
+			`- **Completeness vs IMPLEMENT:** Could **every** official criterion above be satisfied **solely** by executing your \`Edits:\` bullets as written, with at most **local** reads on the planned path — with **zero** extra discovery?\n` +
+			`- **Completeness of mapping:** Does your \`plans[]\` set **fully** cover **every** official criterion, with **no** criterion implicit, partial, or “mostly” addressed?\n` +
+			`- **Zero ambiguity:** Does **each** \`Edits:\` line name **exact** symbols (types / methods / fields / routes) and the **exact** behavioral change — no room for interpretation?\n` +
+			`- **Bullet clarity:** Is every edit bullet **one clear action** (or a tight numbered sub-list) that a stranger could implement in one pass through \`plans[].path\`?\n` +
+			`- **Implementation density:** Are edge cases, error paths, and verification steps for **this file** spelled out in \`Edits:\` / \`Verification:\` — not deferred to “figure out during implement”?\n` +
+			`- **Verbatim JSON:** Will your next \`plan\` payload’s \`task_acceptance_criteria\` array be a **verbatim** copy of the official lines below (same strings, same count — no paraphrase, no invented extras)?\n` +
+			`### Your planned files (human-readable — your draft payload)\n\n` +
+			(planBlocks.length > 0 ? planBlocks.join("\n---\n\n") : "(no plans[] entries parsed from payload)\n") +
+			`\n### Full submitted JSON (for diffing; may be truncated)\n\`\`\`json\n${escapeMarkdownFences(appendix)}\n\`\`\`\n\n` +
+			`---\n` +
+			`### SELF-AUDIT CHECKLIST (answer every point internally before your next action)\n` +
+			`1. **Criterion → bullet trace (NON-NEGOTIABLE):** For **each** official criterion, list the **exact** \`Edits:\` bullet(s) (quote their opening phrase) that implement it, and the \`plans[].path\` for each. If any criterion lacks a bullet-level trace, your plan is **incomplete**.\n` +
+			`2. **Implement-without-discovery test:** For each plan item, cover the \`path\` column on your screen and ask: “Could I implement **only** from \`Scope\`+\`Edits\`+\`Acceptance\`+\`Verification\`?” If **no**, expand \`Edits:\` until **yes**.\n` +
+			`3. **Right file, right symbol:** Every symbol named in \`Edits:\` for an item must **live in** that item’s \`path\` (or be a type explicitly imported there). No “edit method M in file F” when M is actually in another file.\n` +
+			`4. **Literal fidelity:** Every task literal that affects runtime (paths, globs like \`devtools*.zip\`, HTTP codes, directory names like **debug**, strings) appears **verbatim** in the relevant plan text where it matters.\n` +
+			`5. **Ordering:** \`plans[]\` is **dependency / leaf-first** (new leaves before consumers, wiring last) for sequential implement mode.\n` +
+			`6. **New vs existing files:** \`is_new_file\` matches disk reality for every path.\n\n` +
+			`---\n` +
+			`### WHAT TO DO NEXT (strict handshake)\n` +
+			`- If you still need **repository evidence to write those concrete bullets**, call **\`read\` / \`grep\` / \`find\` / \`ls\` / \`bash\`** **now** in PLAN mode. **Any turn that includes a tool other than \`plan\` resets this handshake** — your next \`plan\`-only turn becomes a fresh draft echo.\n` +
+			`- If you are satisfied after self-audit, call **only** \`plan\` again on a **later turn** with the same or corrected JSON. **That second consecutive \`plan\`-only turn is validated** and freezes the contract for IMPLEMENT mode.\n` +
+			`- Do not rely on prose outside tools; the draft echo is not a substitute for a validated plan.\n`;
+
+		return {
+			content: [{ type: "text", text }],
+			details: { planDraftEcho: true as const },
+		};
+	};
+
+	const executePlanModeToolBatchWithHandshake = async (
+		assistantMessage: AssistantMessage,
+		calls: AgentToolCall[],
+	): Promise<ToolResultMessage[]> => {
+		const hasNonPlan = calls.some((tc) => tc.name !== "plan");
+		if (planHandshakeAwaitingConsecutivePlanOnly && hasNonPlan) {
+			planHandshakeAwaitingConsecutivePlanOnly = false;
+			await emitRolloutMarker("plan_handshake_reset", {
+				reason: "non_plan_tool_in_turn",
+				tools: calls.map((t) => t.name),
+			});
+		}
+
+		const hasPlan = calls.some((tc) => tc.name === "plan");
+		const onlyPlan = hasPlan && calls.every((tc) => tc.name === "plan");
+		const useRealPlanValidation = onlyPlan && planHandshakeAwaitingConsecutivePlanOnly;
+
+		const results: ToolResultMessage[] = [];
+		for (const toolCall of calls) {
+			await emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: toolCall.arguments,
+			});
+
+			if (toolCall.name === "plan" && !useRealPlanValidation) {
+				const tc = applyRobustWorkspacePathsToToolCall(toolCall);
+				const rawPlanArgs = tc.arguments ?? {};
+				await emitRolloutMarker("plan_tool_args", {
+					args: rawPlanArgs,
+				});
+				const plansEcho = extractPlanItems(rawPlanArgs);
+				await emitRolloutMarker("plan_draft_echo", {
+					plan_count: plansEcho.length,
+				});
+				const synthetic = buildPlanDraftEchoAgentResult(rawPlanArgs);
+				results.push(await emitToolCallOutcome(tc, synthetic, false, emit, loopStart));
+				continue;
+			}
+
+			const tcExec = applyRobustWorkspacePathsToToolCall(toolCall);
+			if (tcExec.name === "plan" && useRealPlanValidation) {
+				await emitRolloutMarker("plan_tool_args", {
+					args: tcExec.arguments ?? {},
+				});
+			}
+
+			const preparation = await prepareToolCall(currentContext, assistantMessage, tcExec, config, signal);
+			if (preparation.kind === "immediate") {
+				results.push(await emitToolCallOutcome(tcExec, preparation.result, preparation.isError, emit, loopStart));
+			} else {
+				const executed = await executePreparedToolCall(preparation, signal, emit);
+				results.push(
+					await finalizeExecutedToolCall(
+						currentContext,
+						assistantMessage,
+						preparation,
+						executed,
+						config,
+						signal,
+						emit,
+						loopStart,
+					),
+				);
+			}
+		}
+
+		if (onlyPlan && !useRealPlanValidation) {
+			planHandshakeAwaitingConsecutivePlanOnly = true;
+			await emitRolloutMarker("plan_handshake_awaiting_validated_resubmit", {});
+		}
+
+		return results;
 	};
 	const isMutatingBashCommand = (command: string): boolean => {
 		const cmd = command.trim();
@@ -1541,7 +1715,11 @@ async function runLoop(
 						}
 					}
 
-					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit, loopStart)));
+					toolResults.push(
+						...(hasPlanToolCall
+							? await executePlanModeToolBatchWithHandshake(message, toolCalls)
+							: await executeToolCalls(currentContext, message, config, signal, emit, loopStart)),
+					);
 					for (const result of toolResults) {
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1626,10 +1804,10 @@ async function runLoop(
 						const tr = toolResults[i];
 						const tc = toolCalls[i];
 						if (!tc || tc.type !== "toolCall" || tc.name !== "plan") continue;
-						const rawPlanArgs = tc.arguments ?? {};
-						await emitRolloutMarker("plan_tool_args", {
-							args: rawPlanArgs,
-						});
+						const planEchoDetails = (tr as any)?.details as { planDraftEcho?: boolean } | undefined;
+						if (planEchoDetails?.planDraftEcho === true) {
+							continue;
+						}
 						const planTimeoutExceeded = (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
 						if (tr.isError) {
 							const errText = tr.content?.map((c: any) => c?.text ?? "").join("") ?? "unknown plan validation error";
@@ -1735,9 +1913,14 @@ async function runLoop(
 								submitted_at: new Date(submittedAtMs).toISOString(),
 								submitted_ts_ms: submittedAtMs,
 								elapsed_since_loop_start_ms: submittedAtMs - loopStart,
+								handshake: "validated_second_plan_only_turn",
+							});
+							await emitRolloutMarker("plan_handshake_validated", {
+								plan_count: plans.length,
 							});
 						}
 						planSubmitted = true;
+						planHandshakeAwaitingConsecutivePlanOnly = false;
 						executionMode = "implement";
 						implementModeStartedAt = Date.now();
 						// Build the ordered plan list that drives the implement-mode for-loop.
