@@ -774,7 +774,7 @@ async function runLoop(
 		const markerMessage: AgentMessage = {
 			role: "user",
 			content: [{ type: "text", text: `[agent_loop_event] ${JSON.stringify(marker)}` }],
-			timestamp: Date.now(),
+			timestamp: ((Date.now() - loopStart) / 1000),
 		};
 		await emit({ type: "message_start", message: markerMessage });
 		await emit({ type: "message_end", message: markerMessage });
@@ -851,7 +851,7 @@ async function runLoop(
 					`- If imperfect: reply \`IMPERFECT\` and include an \`edit\` or \`write\` tool call for this same file in the same turn.\n` +
 					`- Do not switch files during this confirm step.`,
 			}],
-			timestamp: Date.now(),
+			timestamp: ((Date.now() - loopStart) / 1000),
 		};
 	};
 	const queueNextConfirmPrompt = (): boolean => {
@@ -1070,7 +1070,7 @@ async function runLoop(
 					text: `\`${targetPath}\` updated successfully.`,
 				},
 			],
-			timestamp: Date.now(),
+			timestamp: ((Date.now() - loopStart) / 1000),
 		});
 		if (firstMutation && !multiFileHintSent && plannedFiles.size >= 2) {
 			multiFileHintSent = true;
@@ -1084,7 +1084,7 @@ async function runLoop(
 							text: `Plan-scoped reminder: remaining planned files not yet edited: ${remainingPlanned.slice(0, 6).map((f) => `\`${f}\``).join(", ")}. Continue implementing planned files only — do NOT edit off-plan files even if they seem related.`,
 						},
 					],
-					timestamp: Date.now(),
+					timestamp: ((Date.now() - loopStart) / 1000),
 				});
 			}
 		}
@@ -1121,7 +1121,7 @@ async function runLoop(
 		pendingMessages.push({
 			role: "user",
 			content: [{ type: "text", text: breadthHintText }],
-			timestamp: Date.now(),
+			timestamp: ((Date.now() - loopStart) / 1000),
 		});
 	};
 	const maybeAddSiblingHintAfterRead = async (readPath: string): Promise<void> => {
@@ -1157,7 +1157,7 @@ async function runLoop(
 					type: "text",
 					text: `Siblings near \`${normRead}\`: ${related.map((f: string) => `\`${f}\``).join(", ")}. In PLAN mode, read only those that map to acceptance criteria before submitting \`plan\`.`,
 				}],
-				timestamp: Date.now(),
+				timestamp: ((Date.now() - loopStart) / 1000),
 			});
 		} catch {
 			return;
@@ -1249,7 +1249,7 @@ async function runLoop(
 				type: "text",
 				text: "PLAN search protocol (follow in order): 1) grep exact task terms/paths/symbols, 2) read top owner file(s), 3) sweep only required wiring neighbors (entrypoint/coordinator/utility/fallback/interface), 4) verify every acceptance criterion maps to file(s), 5) call `plan` immediately with exact JSON format. Avoid broad unfocused exploration.",
 			}],
-			timestamp: Date.now(),
+			timestamp: ((Date.now() - loopStart) / 1000),
 		});
 	}
 	while (true) {
@@ -1358,7 +1358,7 @@ async function runLoop(
 								text: "Transient upstream failure occurred. Resume by calling a tool directly — avoid prose. Only file diffs count toward your evaluation score.",
 							},
 						],
-						timestamp: Date.now(),
+						timestamp: ((Date.now() - loopStart) / 1000),
 					});
 					hasMoreToolCalls = false;
 					continue;
@@ -1392,7 +1392,7 @@ async function runLoop(
 									.map((f) => `\`${f}\``)
 									.join(", ")}.`,
 							}],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						hasMoreToolCalls = false;
 						continue;
@@ -1415,7 +1415,7 @@ async function runLoop(
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: "Still in PLAN mode. File mutations are forbidden before plan submission (`edit`/`write` and mutating `bash` commands). Continue broad discovery and then call `plan` with exact JSON format." }],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						hasMoreToolCalls = false;
 						continue;
@@ -1425,7 +1425,7 @@ async function runLoop(
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: "PLAN mode forbids network/probe bash commands (they often fail with ConnectionRefusedError in eval sandboxes). Use only local repository discovery tools and then call `plan` with exact JSON format." }],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						hasMoreToolCalls = false;
 						continue;
@@ -1436,7 +1436,7 @@ async function runLoop(
 					pendingMessages.push({
 						role: "user",
 						content: [{ type: "text", text: "Plan mode timeout reached (~100s). Stop exploration now. Do one final coverage check (each criterion -> file) and call only the `plan` tool with detailed JSON plans." }],
-						timestamp: Date.now(),
+						timestamp: ((Date.now() - loopStart) / 1000),
 					});
 					hasMoreToolCalls = false;
 					continue;
@@ -1451,7 +1451,7 @@ async function runLoop(
 								text: "You are still in PLAN mode. Your last turn had no effective planning progress. Follow right-search order now: grep exact task terms -> read owner file(s) -> sweep required wiring neighbors -> criterion-to-file coverage check -> call `plan` with exact JSON format.",
 							},
 						],
-						timestamp: Date.now(),
+						timestamp: ((Date.now() - loopStart) / 1000),
 					});
 					continue;
 				}
@@ -1465,7 +1465,7 @@ async function runLoop(
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: `Mode violation: ${blocked} is not allowed in PLAN mode. Allowed tools: ${allowList}.` }],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						hasMoreToolCalls = false;
 						continue;
@@ -1487,7 +1487,7 @@ async function runLoop(
 						}
 					}
 
-					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
+					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit, loopStart)));
 					for (const result of toolResults) {
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1499,7 +1499,7 @@ async function runLoop(
 						if (tr.toolName === "bash" && !tr.isError) {
 							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 							if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
-								pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. Network installs and requests will fail. Proceed with `read`, `edit`, and `write` only - avoid `npm install` unless unavoidable." }], timestamp: Date.now() });
+								pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. Network installs and requests will fail. Proceed with `read`, `edit`, and `write` only - avoid `npm install` unless unavoidable." }], timestamp: ((Date.now() - loopStart) / 1000) });
 								break;
 							}
 							const cmd =
@@ -1511,7 +1511,7 @@ async function runLoop(
 								pendingMessages.push({
 									role: "user",
 									content: [{ type: "text", text: "Package installs are slow and often blocked offline. Prefer `edit`/`write` using the repo's existing stack; skip new installs unless the task explicitly names a dependency." }],
-									timestamp: Date.now(),
+									timestamp: ((Date.now() - loopStart) / 1000),
 								});
 								break;
 							}
@@ -1536,7 +1536,7 @@ async function runLoop(
 									pendingMessages.push({
 										role: "user",
 										content: [{ type: "text", text: `The ${tr.toolName} tool is unavailable. Use bash instead:\n\`\`\`\n${bashCmd}\n\`\`\`\nRun this with \`bash\` now.` }],
-										timestamp: Date.now(),
+										timestamp: ((Date.now() - loopStart) / 1000),
 									});
 								}
 							}
@@ -1580,7 +1580,7 @@ async function runLoop(
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: planTimeoutExceeded ? `PLAN timeout reached, but submitted plan is still invalid: ${errText}. Re-submit \`plan\` immediately with corrected paths/structure. Keep it concise but valid.` : `Plan submission failed: ${errText}. Fix and call \`plan\` again.` }],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							continue;
 						}
@@ -1608,7 +1608,7 @@ async function runLoop(
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: `Plan validation failed. Stay in PLAN mode. ${failedPathNudge} ${uncovered} Fix invalid path verification and criteria coverage, then call \`plan\` again. ${preview}` }],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							continue;
 						}
@@ -1620,7 +1620,7 @@ async function runLoop(
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: "Plan submission was empty or malformed. Stay in PLAN mode and call `plan` with exact JSON format. Plans must be detailed." }],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							continue;
 						}
@@ -1630,7 +1630,7 @@ async function runLoop(
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: `Plan coverage incomplete in PLAN mode. Missing required files in \`plan\`: ${missingRequiredInPlan.slice(0, 12).map((f) => `\`${f}\``).join(", ")}. Add them and call \`plan\` again before transition.` }],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							continue;
 						}
@@ -1648,7 +1648,7 @@ async function runLoop(
 							const elapsedMs = submittedAtMs - loopStart;
 							const elapsedSec = (elapsedMs / 1000).toFixed(2);
 							lines.push(
-								`[plan] submitted ${plans.length} item(s) submitted_at=${submittedAtIso} elapsed_since_loop_start_ms=${elapsedMs} submitted_ts_ms=${submittedAtMs} elapsed_since_loop_start_s=${elapsedSec}`,
+								`[plan] submitted ${plans.length} item(s) submitted_at=${submittedAtIso} elapsed_since_loop_start_s=${elapsedSec}`,
 							);
 							for (let idx = 0; idx < plans.length; idx++) {
 								const p: any = plans[idx];
@@ -1658,7 +1658,7 @@ async function runLoop(
 									? p.acceptance_criteria.filter((c: unknown) => typeof c === "string" && c.trim().length > 0)
 									: [];
 								const planText = typeof p?.plan === "string" ? p.plan.trim() : "";
-								lines.push(`#${idx + 1} path=${pathText} is_new_file=${isNew} submitted_at=${submittedAtIso} elapsed_since_loop_start_ms=${elapsedMs}`);
+								lines.push(`#${idx + 1} path=${pathText} is_new_file=${isNew} submitted_at=${submittedAtIso} elapsed_since_loop_start_s=${elapsedSec}`);
 								if (acceptanceRefs.length > 0) {
 									lines.push(`acceptance_criteria=${acceptanceRefs.join(" | ")}`);
 								}
@@ -1689,7 +1689,7 @@ async function runLoop(
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: `Switched to IMPLEMENT mode. Implement all planned files with minimal, style-matched edits. Planned files: ${[...plannedFiles].slice(0, 100).map((p) => `\`${p}\``).join(", ")}. Call \`read\` first (full file) before \`edit\`/\`write\` on that file.` }],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 					}
 
@@ -1706,7 +1706,7 @@ async function runLoop(
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: `You have read \`${rp}\` ${cnt} times - stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` or \`write\` on a different file or stop."}` }],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							break;
 						}
@@ -1716,7 +1716,7 @@ async function runLoop(
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: `Context gathered (${explorationCount} reads/bashes). Apply your first file change (\`edit\` or \`write\`) to the highest-priority target now. A partial patch always outscores an empty diff.` }],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						explorationCount = 0;
 					}
@@ -1738,7 +1738,7 @@ async function runLoop(
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: "All planned files confirmed PERFECT." }],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 						}
 						hasMoreToolCalls = false;
@@ -1752,7 +1752,7 @@ async function runLoop(
 								type: "text",
 								text: `CONFIRMPLAN for \`${confirmCurrentPath}\`: you returned IMPERFECT without a fix tool call. Submit \`edit\` or \`write\` for this file now.`,
 							}],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						hasMoreToolCalls = false;
 						continue;
@@ -1774,7 +1774,7 @@ async function runLoop(
 									type: "text",
 									text: `CONFIRMPLAN fix calls must target only \`${confirmCurrentPath}\`. Retry with \`edit\`/\`write\` for that file.`,
 								}],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							hasMoreToolCalls = false;
 							continue;
@@ -1788,7 +1788,7 @@ async function runLoop(
 								type: "text",
 								text: `CONFIRMPLAN for \`${confirmCurrentPath}\`: reply with \`PERFECT\` or \`IMPERFECT\` (+ fix tool call).`,
 							}],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						continue;
 					}
@@ -1816,7 +1816,7 @@ async function runLoop(
 							type: "text",
 							text: `Implement-mode anti-stall: ${implementReadOnlyRequiredTurns} consecutive read-only turns while planned work remains. Stop read-only turns and apply \`edit\` or \`write\` now${nextTarget ? ` on \`${nextTarget}\`` : ""}.`,
 						}],
-						timestamp: Date.now(),
+						timestamp: ((Date.now() - loopStart) / 1000),
 					});
 				}
 				if (!hasMoreToolCalls) {
@@ -1836,7 +1836,7 @@ async function runLoop(
 								type: "text",
 								text: "IMPLEMENT mode requires tool calls every turn. Call `read`, `edit`, or `write` now for planned files only.",
 							}],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						continue;
 					}
@@ -1854,21 +1854,10 @@ async function runLoop(
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: `Mode violation: ${blocked} is not allowed in IMPLEMENT mode. Allowed tools: ${allowList}.` }],
-							timestamp: Date.now(),
+							timestamp: ((Date.now() - loopStart) / 1000),
 						});
 						hasMoreToolCalls = false;
 						continue;
-					}
-					for (const tc of toolCalls) {
-						if (!tc || tc.type !== "toolCall" || tc.name !== "edit") continue;
-						const tPath = resolvedLoopPathForTool(tc) ?? "";
-						const args = (tc.arguments as any) ?? {};
-						const edits = Array.isArray(args.edits) ? args.edits : [];
-						if (edits.length > 6) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit call on \`${tPath || "unknown file"}\` has ${edits.length} blocks. Split into smaller calls (max 6 blocks) to reduce mismatch and over-edit risk.` }], timestamp: Date.now() });
-							hasMoreToolCalls = false;
-							break;
-						}
 					}
 					if (!hasMoreToolCalls) {
 						await emit({ type: "turn_end", message, toolResults: [] });
@@ -1891,7 +1880,7 @@ async function runLoop(
 						}
 					}
 
-					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
+					toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit, loopStart)));
 					for (const result of toolResults) {
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1905,7 +1894,7 @@ async function runLoop(
 							const targetPath = resolvedLoopPathForTool(tc);
 							if (!targetPath) continue;
 							if (tr.isError) {
-								if (pendingMessages.length === 0) pendingMessages.push({ role: "user", content: [{ type: "text", text: `Write failed for \`${targetPath}\`. Check path and arguments; retry with \`write\` or switch to \`edit\` on an existing file.` }], timestamp: Date.now() });
+								if (pendingMessages.length === 0) pendingMessages.push({ role: "user", content: [{ type: "text", text: `Write failed for \`${targetPath}\`. Check path and arguments; retry with \`write\` or switch to \`edit\` on an existing file.` }], timestamp: ((Date.now() - loopStart) / 1000) });
 								continue;
 							}
 							await recordSuccessfulFileMutation(targetPath);
@@ -1920,7 +1909,7 @@ async function runLoop(
 								pendingMessages.push({
 									role: "user",
 									content: [{ type: "text", text: buildGeminiEditFailureRecoveryMessage(targetPath, errText, tc, foundFiles) }],
-									timestamp: Date.now(),
+									timestamp: ((Date.now() - loopStart) / 1000),
 								});
 							}
 						} else {
@@ -1949,7 +1938,7 @@ async function runLoop(
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: `IMPLEMENT read loaded \`${readPath}\`. Next action must be \`edit\`/\`write\` for planned changes only.${planText ? `\n\nPlanned edits for this file:\n${planText}` : ""}\n\nMatch existing local style (naming, formatting, surrounding patterns) in this file.` }],
-								timestamp: Date.now(),
+								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 						}
 					}
@@ -1973,7 +1962,7 @@ async function runLoop(
 							type: "text",
 							text: "No net persisted edits detected yet. Continue implement mode with concrete edit/write calls that leave actual file changes.",
 						}],
-						timestamp: Date.now(),
+						timestamp: ((Date.now() - loopStart) / 1000),
 					});
 					continue;
 				}
@@ -2009,7 +1998,7 @@ async function runLoop(
 							type: "text",
 							text: "No net file changes are currently detected versus earlier reads. Do not stop. Re-read target planned files and apply concrete edits that persist on disk.",
 						}],
-						timestamp: Date.now(),
+						timestamp: ((Date.now() - loopStart) / 1000),
 					});
 					continue;
 				}
@@ -2045,7 +2034,7 @@ async function runLoop(
 					type: "text",
 					text: "Cannot stop in PLAN mode. Continue exploration and submit final file-by-file plan via `plan` tool.",
 				}],
-				timestamp: Date.now(),
+				timestamp: ((Date.now() - loopStart) / 1000),
 			}];
 			continue;
 		} else if (executionMode === "implement") {
@@ -2062,7 +2051,7 @@ async function runLoop(
 						type: "text",
 						text: "Invariant correction: implement mode requires successful `plan` tool call first. Return to PLAN mode, finish planning, and call `plan` tool with exact JSON format.",
 					}],
-					timestamp: Date.now(),
+					timestamp: ((Date.now() - loopStart) / 1000),
 				}];
 				continue;
 			}
@@ -2074,7 +2063,7 @@ async function runLoop(
 						type: "text",
 						text: `Do not stop. Planned files still unedited: ${missingFromPlan.slice(0, 10).map((f) => `\`${f}\``).join(", ")}. Implement all planned files.`,
 					}],
-					timestamp: Date.now(),
+					timestamp: ((Date.now() - loopStart) / 1000),
 				}];
 				continue;
 			}
@@ -2089,7 +2078,7 @@ async function runLoop(
 							.map((f) => `\`${f}\``)
 							.join(", ")}. Continue implementing those plan details before stopping.`,
 					}],
-					timestamp: Date.now(),
+					timestamp: ((Date.now() - loopStart) / 1000),
 				}];
 				continue;
 			}
@@ -2122,7 +2111,7 @@ async function runLoop(
 			pendingMessages = [{
 				role: "user",
 				content: [{ type: "text", text: `REVIEW: You edited ${editedPaths.size} file(s): ${[...editedPaths].slice(0, 8).join(", ")}. ${hint}` }],
-				timestamp: Date.now(),
+				timestamp: ((Date.now() - loopStart) / 1000),
 			}];
 			continue;
 		}
@@ -2250,12 +2239,13 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	loopStart: number,
 ): Promise<ToolResultMessage[]> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	if (config.toolExecution === "sequential") {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit, loopStart);
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, loopStart);
 }
 
 async function executeToolCallsSequential(
@@ -2265,6 +2255,7 @@ async function executeToolCallsSequential(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	loopStart: number,
 ): Promise<ToolResultMessage[]> {
 	const results: ToolResultMessage[] = [];
 
@@ -2278,7 +2269,7 @@ async function executeToolCallsSequential(
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
-			results.push(await emitToolCallOutcome(toolCall, preparation.result, preparation.isError, emit));
+			results.push(await emitToolCallOutcome(toolCall, preparation.result, preparation.isError, emit, loopStart));
 		} else {
 			const executed = await executePreparedToolCall(preparation, signal, emit);
 			results.push(
@@ -2290,6 +2281,7 @@ async function executeToolCallsSequential(
 					config,
 					signal,
 					emit,
+					loopStart,
 				),
 			);
 		}
@@ -2305,6 +2297,7 @@ async function executeToolCallsParallel(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	loopStart: number,
 ): Promise<ToolResultMessage[]> {
 	const results: ToolResultMessage[] = [];
 	const runnableCalls: PreparedToolCall[] = [];
@@ -2319,7 +2312,7 @@ async function executeToolCallsParallel(
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
-			results.push(await emitToolCallOutcome(toolCall, preparation.result, preparation.isError, emit));
+			results.push(await emitToolCallOutcome(toolCall, preparation.result, preparation.isError, emit, loopStart));
 		} else {
 			runnableCalls.push(preparation);
 		}
@@ -2341,6 +2334,7 @@ async function executeToolCallsParallel(
 				config,
 				signal,
 				emit,
+				loopStart,
 			),
 		);
 	}
@@ -2478,6 +2472,7 @@ async function finalizeExecutedToolCall(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	loopStart: number,
 ): Promise<ToolResultMessage> {
 	let result = executed.result;
 	let isError = executed.isError;
@@ -2503,7 +2498,7 @@ async function finalizeExecutedToolCall(
 		}
 	}
 
-	return await emitToolCallOutcome(prepared.toolCall, result, isError, emit);
+	return await emitToolCallOutcome(prepared.toolCall, result, isError, emit, loopStart);
 }
 
 function createErrorToolResult(message: string): AgentToolResult<any> {
@@ -2518,6 +2513,7 @@ async function emitToolCallOutcome(
 	result: AgentToolResult<any>,
 	isError: boolean,
 	emit: AgentEventSink,
+	loopStart: number
 ): Promise<ToolResultMessage> {
 	await emit({
 		type: "tool_execution_end",
@@ -2534,7 +2530,7 @@ async function emitToolCallOutcome(
 		content: result.content,
 		details: result.details,
 		isError,
-		timestamp: Date.now(),
+		timestamp: ((Date.now() - loopStart) / 1000),
 	};
 
 	await emit({ type: "message_start", message: toolResultMessage });
