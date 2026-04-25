@@ -70,7 +70,7 @@ function detectFileStyle(cwd: string, relPath: string): string | null {
 		const stat = statSync(full);
 		if (!stat.isFile() || stat.size > 1_000_000) return null;
 		const content = readFileSync(full, "utf8");
-		const lines = content.split("\n").slice(0, 40);
+		const lines = content.split("\n").slice(0, 60);
 		if (lines.length === 0) return null;
 		let usesTabs = 0, usesSpaces = 0;
 		const spaceWidths = new Map<number, number>();
@@ -152,7 +152,7 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			.filter(k => k.length >= 3 && k.length <= 80)
 			.filter(k => !/["']/.test(k))
 			.filter(k => !STOP_WORDS.has(k.toLowerCase()))
-			.slice(0, 30);
+			.slice(0, 50);
 		if (filtered.length === 0 && paths.size === 0) return "";
 
 		const fileHits = new Map<string, Set<string>>();
@@ -202,7 +202,7 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			if (kw.includes("/") || kw.includes(" ") || kw.length > 40) continue;
 			try {
 				const nameResult = execSync(
-					`find . -type f -iname "*${shellEscape(kw)}*" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/build/*" -not -path "*/.next/*" | head -10`,
+					`find . -type f -iname "*${shellEscape(kw)}*" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/build/*" -not -path "*/.next/*" | head -15`,
 					{ cwd, timeout: 2000, encoding: "utf-8", maxBuffer: 1024 * 1024 },
 				).trim();
 				if (nameResult) {
@@ -240,33 +240,33 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			sections.push("\nFILES EXPLICITLY NAMED IN THE TASK (highest priority — start here):");
 			for (const p of literalPaths) sections.push(`- ${p}`);
 		}
-		const exactByName = [...exactFilenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 10);
+		const exactByName = [...exactFilenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 15);
 		const shownFiles = new Set(literalPaths);
 		const exactNotShown = exactByName.filter(([f]) => !shownFiles.has(f));
 		if (exactNotShown.length > 0) {
 			sections.push("\nFILES MATCHING EXACT FILENAME (very high priority):");
 			for (const [file, kws] of exactNotShown) {
-				sections.push(`- ${file} (exact name: ${[...kws].slice(0, 3).join(", ")})`);
+				sections.push(`- ${file} (exact name: ${[...kws].slice(0, 5).join(", ")})`);
 				shownFiles.add(file);
 			}
 		}
 
 		// Show filename matches separately (high priority)
-		const sortedFilename = [...filenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 8);
+		const sortedFilename = [...filenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 10);
 		const newFilenameHits = sortedFilename.filter(([f]) => !shownFiles.has(f));
 		if (newFilenameHits.length > 0) {
 			sections.push("\nFILES MATCHING BY NAME (high priority — likely need edits):");
-			for (const [file, kws] of newFilenameHits) { sections.push(`- ${file} (name matches: ${[...kws].slice(0, 3).join(", ")})`); shownFiles.add(file); }
+			for (const [file, kws] of newFilenameHits) { sections.push(`- ${file} (name matches: ${[...kws].slice(0, 5).join(", ")})`); shownFiles.add(file); }
 		}
 
 		// Content hits excluding already shown
 		const contentOnly = sorted.filter(([f]) => !shownFiles.has(f));
 		if (contentOnly.length > 0) {
 			sections.push("\nFILES CONTAINING TASK KEYWORDS:");
-			for (const [file, kws] of contentOnly) sections.push(`- ${file} (matches: ${[...kws].slice(0, 4).join(", ")})`);
+			for (const [file, kws] of contentOnly) sections.push(`- ${file} (matches: ${[...kws].slice(0, 5).join(", ")})`);
 		} else if (sorted.length > 0) {
 			sections.push("\nLIKELY RELEVANT FILES (ranked by task keyword matches):");
-			for (const [file, kws] of sorted) sections.push(`- ${file} (matches: ${[...kws].slice(0, 4).join(", ")})`);
+			for (const [file, kws] of sorted) sections.push(`- ${file} (matches: ${[...kws].slice(0, 5).join(", ")})`);
 		}
 
 		if (sorted.length > 0) {
@@ -353,10 +353,15 @@ Your planning quality is judged by:
 - Allowed tools: \`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`, \`plan\` only. **Never** \`edit\`, \`write\` or \`editdone\`.
 - Do not stop in PLAN mode without a **validated** \`plan\` call (see the two-step handshake below: a draft \`plan\`-only turn is echoed but **not** validated).
 - Do not run tests, builds, linters, servers, formatters, or git operations.
+- **Path proof policy (non-negotiable):** every filepath passed to \`read\` or \`plan\` must be an **EXACT verbatim path** already proven by discovery output (\`ls\`/\`find\`/\`grep\`/\`bash\`). Never invent or "best-guess" a path.
+- If unsure about a path, run discovery first and copy the printed path character-for-character into \`read.path\` and \`plans[].path\`.
+- Read the file content before making plan for that file. Do not make plan for a file without reading its content first.
+- When you read a file, you must use exact path which is from \`bash\`, \`grep\`, \`find\`, \`ls\` tool calls. Do NOT guess the file path. If you are not sure about the file path, you must confirm the path using \`ls\` and \`find\` tools. Call \`ls\` tool from the repo directory to target file's parent directory one by one until you find the file.
+- If read tool returns "Path not found" error message, re-run discovery first and copy the proven path character-for-character; never retry with another guessed variant.
 - If planning a new file, first prove an existing file cannot satisfy the requirement; prefer editing existing files when possible.
 - New-file naming must be **literal and pattern-matched**: derive basename from task symbols and nearest sibling conventions; avoid invented prefixes/suffixes (e.g., \`Custom\`, \`New\`, \`Temp\`) unless explicitly required by task text.
 - Time budget is tight (100s): avoid wandering. Do fast, evidence-driven discovery and submit \`plan\` as soon as coverage is complete.
-- **Plan size:** \`plans\` must list **fewer than 10 files** (at most **9** entries). Typical tasks need fewer than 10 files. If you planned more than 10 files, it means your plans are wrong. You should think about your plans again. Search on sibling directories for related files. 
+- **Plan size:** \`plans\` must list **fewer than 16 files** (at most **15** entries). Typical tasks need fewer than 16 files. If you planned more than 16 files, it means your plans are wrong. You should think about your plans again. Search on sibling directories for related files. 
 
 ## Universal planning protocol (must follow)
 
@@ -384,9 +389,16 @@ If evidence is weak, do one more targeted grep/read step. Do not broad-scan the 
 ### Step 2: Discover with evidence, not guesses
 - Grep-first with exact words from the task (paths, symbols, labels, routes, field names, error text).
 - Read files that appear to own the behavior.
+- For each \`read\` call, use only a path explicitly printed by discovery tools(\`ls\`/\`find\`/\`grep\`/\`bash\`) output; guessed directories/filenames are invalid.
 - For each candidate file, collect direct evidence linking file -> criterion.
 - If a criterion implies cross-layer wiring (e.g., API + agent + prompt + route + CLI/web), explicitly check adjacent layers.
 - If logic appears duplicated in multiple modules, identify the **shared utility or common parser/adapter** and prefer planning the shared fix over isolated per-file patches.
+
+### Path correction policy (strict)
+- If \`plan\` validation returns failed paths with \`suggested_paths\`, check suggested filepaths first and replace wrong \`plans[].path\` entries from that list whenever they match your intended target.
+- If suggested paths do not include the real target file, it means you never read that file before. So you must discover the file again (\`ls\`/\`find\`/\`grep\`) and read that file fully with exact path and make the plan again with exact path and full content.
+- Do not call \`plan\` again without wrong path correction.
+- Never resubmit \`plan\` with the same unresolved wrong paths.
 
 ### Step 2.5: System completeness sweep (mandatory)
 Before locking file set, run a quick completeness sweep for each changed behavior:
@@ -403,7 +415,7 @@ If a behavior must be consistent across interfaces, include all interface entryp
 - Include wiring files needed to make behavior reachable end-to-end.
 - Exclude speculative files with no criterion evidence.
 - Never finish with uncovered criteria.
-- Keep the planned file count **under 10** (at most **9** \`plans[]\` items).
+- Keep the planned file count **under 16** (at most **15** \`plans[]\` items).
 - All plans must be VERY detailed and clear. In implementat mode, each plan is used as a ultimate goal, so in each plan, there must not be any ambiguity or missing details.
 - When the task specifies exact strings, values, labels, or identifiers, reproduce them character-for-character in your edit plans.
 
@@ -462,12 +474,13 @@ Call \`plan\` with:
 \`{ "task_acceptance_criteria": ["<criterion 1>", "<criterion 2>", "..."], "plans": [ { "path": "...", "plan": "...", "acceptance_criteria": ["<criterion text>", "..."], "is_new_file": true/false }, ... ] }\`
 
 Required payload contract (strict):
-- \`plans\` length must be fewer than 10 (at most 9 items); the \`plan\` tool rejects longer arrays
+- \`plans\` length must be fewer than 16 (at most 15 items); the \`plan\` tool rejects longer arrays
 - top-level \`task_acceptance_criteria\` is required and must include the full task criteria list which is covered by all plans
 - each \`plans[]\` item must include \`acceptance_criteria\` (non-empty array)
 - every value in \`plans[].acceptance_criteria\` must exactly match one value from \`task_acceptance_criteria\`
 - union of all \`plans[].acceptance_criteria\` must cover **all** \`task_acceptance_criteria\` (no uncovered criterion)
 - if even one planned path fails validation, stay in PLAN mode and resubmit corrected \`plan\`
+- each \`plans[].path\` must be copied verbatim from a proven discovery output path (\`ls\`/\`find\`/\`grep\`/\`bash\`), not guessed
 
 Each \`plans[].plan\` MUST use this structure:
 - \`Scope:\` exact responsibility of this file for the task
@@ -513,11 +526,13 @@ Example:
 ## Plan quality gate (strict)
 
 Before calling \`plan\`, ensure ALL are true:
-- \`plans\` has fewer than 10 entries (at most 9 files)
+- \`plans\` has fewer than 16 entries (at most 15 files)
 - every requirement/criterion maps to at least one planned file
 - \`task_acceptance_criteria\` exactly lists task criteria and each criterion is mapped in at least one \`plans[].acceptance_criteria\`
 - no explicit/named required file is missing
 - every expected file has been discovered via read/search evidence (not guessed)
+- every \`plans[].path\` is a proven verbatim discovery path (copied from tool output), never an inferred/guessed path
+- if any previous \`plan\` attempt returned \`suggested_paths\`, wrong paths were corrected first (use suggestions first; rediscover only when needed)
 - all expected files are included in planned paths unless there is explicit evidence they are unaffected
 - every plan is VERY detailed and specific and there is no any ambiguity or missing details. 
 - every plan item includes non-empty \`acceptance_criteria\` with exact criterion text
@@ -527,6 +542,7 @@ Before calling \`plan\`, ensure ALL are true:
 - no "single-path only" plans for requirements that explicitly demand cross-interface consistency
 - plan does not introduce likely syntax/runtime hazards (string quoting, malformed literals, invalid signatures, broken imports) in edited files
 - **plans are in dependency order** (Step 3.5): new leaf files first, logic that uses them next, wiring/registration/delegation last. For every prefix of \`plans\`, all referenced symbols already exist (either pre-existing in the repo or introduced by an earlier plan in the array).
+- read the file content before making plan for that file. Do not make plan for a file without reading its content first.
 
 Then call \`plan\` (see Step 4 handshake: first \`plan\`-only turn is draft echo; second consecutive \`plan\`-only turn is validated).
 
@@ -603,7 +619,7 @@ A \`plan\` was **validated and committed** (second consecutive \`plan\`-only sub
 const TAU_SCORING_PREAMBLE = `${TAU_SCORING_HEADER}## Hard constraints
 
 - Start with a tool call immediately.
-- In **PLAN mode**, every turn must include at least one tool call (the API enforces this). Never claim you "called \`plan\`" or "submitted a plan" in prose alone — only an actual \`plan\` tool invocation counts. \`plans\` must be a non-empty array (minItems: 1) and **fewer than 10 items** (at most 9 files); empty or oversized \`plans\` is invalid.
+- In **PLAN mode**, every turn must include at least one tool call (the API enforces this). Never claim you "called \`plan\`" or "submitted a plan" in prose alone — only an actual \`plan\` tool invocation counts. \`plans\` must be a non-empty array (minItems: 1) and **fewer than 16 items** (at most 15 files); empty or oversized \`plans\` is invalid.
 - Initial state is always **PLAN mode** at the beginning of every run.
 - Operate in two phases:
   - **PLAN mode**: allowed tools are \`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`, \`plan\`. Search broadly and thoroughly for all criteria coverage.

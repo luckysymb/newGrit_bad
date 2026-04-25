@@ -956,6 +956,8 @@ async function runLoop(
 			`After your **validated** second \`plan\`-only submission, the agent enters **IMPLEMENT** mode. There you must **complete every official acceptance criterion** using **only** what is already frozen in your plans — **not** by treating implement mode as a second discovery pass.\n\n` +
 			`- **No “research to finish the spec”:** You must **not** depend on exploratory \`grep\`, broad \`read\` sweeps, or guessing owners/symbols to figure out what the task meant. Anything required to pass a criterion must already appear in the matching \`plans[].plan\` (**Scope / Edits / Acceptance / Verification**).\n` +
 			`- **Reads are local glue only:** In implement mode, \`read\` exists only to refresh exact file text or skim **already-scoped** neighbors (imports, small helpers) for the **current** planned file — **not** to replace missing \`Edits:\` detail you should have written here in PLAN mode.\n` +
+			`- **Path proof policy (NON-NEGOTIABLE):** every path used in \`read\` and every \`plans[].path\` must be an **EXACT verbatim discovery-proven path** copied from \`ls\`/\`find\`/\`grep\`/\`bash\` output. Guessed or inferred paths are invalid.\n` +
+			`- **Path-not-found handling:** if \`read\` fails with path-not-found, re-run discovery first and copy the proven path character-for-character; never retry with another guessed variant.\n` +
 			`- **Every \`Edits:\` bullet is an executable contract:** Each bullet must be **self-contained**: a competent engineer (or another LLM) can perform that edit **without opening unrelated files to infer intent**. Name **concrete** types, methods, fields, routes, HTTP status codes, JSON property names, zip glob patterns, directories, and before→after behavior.\n` +
 			`- **Ban vague edit language:** Phrases like “wire up appropriately”, “ensure authentication works”, “handle errors”, “update as needed”, “integrate with the system”, or “add support for X” **without** naming the exact symbol and change are **forbidden** — rewrite into precise mechanical steps.\n\n` +
 			`### OFFICIAL task acceptance criteria (from the task)\n${officialCriteriaBlock}\n\n` +
@@ -975,8 +977,9 @@ async function runLoop(
 			`2. **Implement-without-discovery test:** For each plan item, cover the \`path\` column on your screen and ask: “Could I implement **only** from \`Scope\`+\`Edits\`+\`Acceptance\`+\`Verification\`?” If **no**, expand \`Edits:\` until **yes**.\n` +
 			`3. **Right file, right symbol:** Every symbol named in \`Edits:\` for an item must **live in** that item’s \`path\` (or be a type explicitly imported there). No “edit method M in file F” when M is actually in another file.\n` +
 			`4. **Literal fidelity:** Every task literal that affects runtime (paths, globs like \`devtools*.zip\`, HTTP codes, directory names like **debug**, strings) appears **verbatim** in the relevant plan text where it matters.\n` +
-			`5. **Ordering:** \`plans[]\` is **dependency / leaf-first** (new leaves before consumers, wiring last) for sequential implement mode.\n` +
-			`6. **New vs existing files:** \`is_new_file\` matches disk reality for every path.\n\n` +
+			`5. **Verbatim proven paths:** Every \`plans[].path\` is copied character-for-character from proven discovery output (\`ls\`/\`find\`/\`grep\`/\`bash\`). No guessed folders, no guessed filenames, no “probably this path”.\n` +
+			`6. **Ordering:** \`plans[]\` is **dependency / leaf-first** (new leaves before consumers, wiring last) for sequential implement mode.\n` +
+			`7. **New vs existing files:** \`is_new_file\` matches disk reality for every path.\n\n` +
 			`---\n` +
 			`### WHAT TO DO NEXT (strict handshake)\n` +
 			`- If you still need **repository evidence to write those concrete bullets**, call **\`read\` / \`grep\` / \`find\` / \`ls\` / \`bash\`** **now** in PLAN mode. **Any turn that includes a tool other than \`plan\` resets this handshake** — your next \`plan\`-only turn becomes a fresh draft echo.\n` +
@@ -993,6 +996,14 @@ async function runLoop(
 		assistantMessage: AssistantMessage,
 		calls: AgentToolCall[],
 	): Promise<ToolResultMessage[]> => {
+		const injectPlanModeReadPaths = (tc: AgentToolCall): AgentToolCall => {
+			if (tc.name !== "plan") return tc;
+			const args = (tc.arguments && typeof tc.arguments === "object")
+				? { ...(tc.arguments as Record<string, unknown>) }
+				: {};
+			args.plan_mode_read_paths = [...planModeReadPaths];
+			return { ...tc, arguments: args };
+		};
 		const hasNonPlan = calls.some((tc) => tc.name !== "plan");
 		if (planHandshakeAwaitingConsecutivePlanOnly && hasNonPlan) {
 			planHandshakeAwaitingConsecutivePlanOnly = false;
@@ -1008,15 +1019,16 @@ async function runLoop(
 
 		const results: ToolResultMessage[] = [];
 		for (const toolCall of calls) {
+			const toolCallWithReadPaths = injectPlanModeReadPaths(toolCall);
 			await emit({
 				type: "tool_execution_start",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				args: toolCall.arguments,
+				toolCallId: toolCallWithReadPaths.id,
+				toolName: toolCallWithReadPaths.name,
+				args: toolCallWithReadPaths.arguments,
 			});
 
-			if (toolCall.name === "plan" && !useRealPlanValidation) {
-				const tc = applyRobustWorkspacePathsToToolCall(toolCall);
+			if (toolCallWithReadPaths.name === "plan" && !useRealPlanValidation) {
+				const tc = applyRobustWorkspacePathsToToolCall(toolCallWithReadPaths);
 				const rawPlanArgs = tc.arguments ?? {};
 				await emitRolloutMarker("plan_tool_args", {
 					args: rawPlanArgs,
@@ -1030,7 +1042,7 @@ async function runLoop(
 				continue;
 			}
 
-			const tcExec = applyRobustWorkspacePathsToToolCall(toolCall);
+			const tcExec = applyRobustWorkspacePathsToToolCall(toolCallWithReadPaths);
 			if (tcExec.name === "plan" && useRealPlanValidation) {
 				await emitRolloutMarker("plan_tool_args", {
 					args: tcExec.arguments ?? {},
@@ -1618,7 +1630,7 @@ async function runLoop(
 								text: `Before calling \`plan\`, discover expected files first. Call \`read\` (full file) on: ${undiscovered
 									.slice(0, 12)
 									.map((f) => `\`${f}\``)
-									.join(", ")}.`,
+									.join(", ")}. Path policy: use only EXACT verbatim paths proven by \`ls\`/\`find\`/\`grep\` output; do not guess paths.`,
 							}],
 							timestamp: ((Date.now() - loopStart) / 1000),
 						});
@@ -1731,7 +1743,7 @@ async function runLoop(
 						if (tr.toolName === "bash" && !tr.isError) {
 							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 							if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
-								pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. Network installs and requests will fail. Proceed with `read`, `edit`, and `write` only - avoid `npm install` unless unavoidable." }], timestamp: ((Date.now() - loopStart) / 1000) });
+								pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. Network installs and requests will fail." }], timestamp: ((Date.now() - loopStart) / 1000) });
 								break;
 							}
 							const cmd =
@@ -1742,7 +1754,7 @@ async function runLoop(
 							if (/\bnpm\s+(?:i|install|ci)\b/i.test(haystack) || /\bpnpm\s+(?:i|install|add)\b/i.test(haystack) || /\byarn\s+(?:add|install)\b/i.test(haystack)) {
 								pendingMessages.push({
 									role: "user",
-									content: [{ type: "text", text: "Package installs are slow and often blocked offline. Prefer `edit`/`write` using the repo's existing stack; skip new installs unless the task explicitly names a dependency." }],
+									content: [{ type: "text", text: "Package installs are blocked offline. Skip new installs." }],
 									timestamp: ((Date.now() - loopStart) / 1000),
 								});
 								break;
@@ -1816,7 +1828,23 @@ async function runLoop(
 							});
 							pendingMessages.push({
 								role: "user",
-								content: [{ type: "text", text: planTimeoutExceeded ? `PLAN timeout reached, but submitted plan is still invalid: ${errText}. Re-submit \`plan\` immediately with corrected paths/structure. Keep it concise but valid.` : `Plan submission failed: ${errText}. Fix and call \`plan\` again.` }],
+								content: [{
+									type: "text",
+									text:
+										`PLAN mode remediation: your \`plan\` call failed validation and cannot transition to IMPLEMENT yet.\n` +
+										`${planTimeoutExceeded
+											? `PLAN timeout reached; submit a corrected \`plan\` now.`
+											: `Stay in PLAN mode and submit a corrected \`plan\`.`}\n` +
+										`Validator error:\n${errText}\n\n` +
+										`Fix checklist (do all):\n` +
+										`1) Use exact payload keys: \`task_acceptance_criteria\`, \`plans\`, and for each plan item: \`path\`, \`plan\`, \`acceptance_criteria\`, \`is_new_file\`.\n` +
+										`2) Ensure \`plans\` is non-empty and under the max file cap.\n` +
+										`3) Ensure each \`plans[].acceptance_criteria\` is non-empty and maps to official task criteria.\n` +
+										`4) Ensure each \`plans[].plan\` is implement-ready with explicit \`Scope:\`, \`Edits:\`, \`Acceptance:\`, \`Verification:\`.\n` +
+										`5) Ensure every \`plans[].path\` is an EXACT verbatim path proven by \`ls\`/\`find\`/\`grep\` output (no guessed paths).\n` +
+										`6) Ensure \`is_new_file\` is correct for each path.\n\n` +
+										`Then call \`plan\` again (tool call only).`,
+								}],
 								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							continue;
@@ -1842,9 +1870,26 @@ async function runLoop(
 							const uncovered = Array.isArray(planDetails?.uncoveredCriteria) && planDetails!.uncoveredCriteria.length > 0
 								? `Uncovered task criteria: ${planDetails!.uncoveredCriteria.slice(0, 6).map((c: string) => `"${c}"`).join(" | ")}.`
 								: "";
+							const strictPathCorrectionInstruction =
+								failedPaths.length > 0
+									? "Check the suggested filepaths first. If there isn't the right path what you really target, then discover the file again. Don't call plan tool again without wrong path correction."
+									: "";
 							pendingMessages.push({
 								role: "user",
-								content: [{ type: "text", text: `Plan validation failed. Stay in PLAN mode. ${failedPathNudge} ${uncovered} Fix invalid path verification and criteria coverage, then call \`plan\` again. ${preview}` }],
+								content: [{
+									type: "text",
+									text:
+										`PLAN mode remediation: plan validation failed. Stay in PLAN mode.\n` +
+										`${failedPathNudge ? `${failedPathNudge}\n` : ""}` +
+										`${uncovered ? `${uncovered}\n` : ""}` +
+										`Detailed validator results:\n${preview}\n\n` +
+										`Required correction before next \`plan\` call:\n` +
+										`- Correct every failed path using EXACT verbatim discovery-proven paths only (\`ls\`/\`find\`/\`grep\` output), or set \`is_new_file\` appropriately.\n` +
+										`${strictPathCorrectionInstruction ? `- ${strictPathCorrectionInstruction}\n` : ""}` +
+										`- Ensure criteria coverage is complete and correctly mapped.\n` +
+										`- Keep each plan item fully implementable (no ambiguity in \`Edits:\`).\n` +
+										`- Re-submit one corrected \`plan\` payload.`,
+								}],
 								timestamp: ((Date.now() - loopStart) / 1000),
 							});
 							continue;
@@ -1948,34 +1993,6 @@ async function runLoop(
 							if (firstMsg) queueImplementInjectMessage(firstMsg);
 						}
 					}
-
-					const now = Date.now();
-					if (now - lastRereadNudgeAt >= 5_000 && pendingMessages.length === 0) {
-						for (const [rp, cnt] of pathReadCounts) {
-							if (cnt < 3) continue;
-							lastRereadNudgeAt = now;
-							const normRp = rp.replace(/^\.\//, "");
-							const others = foundFiles.filter((f: string) => {
-								const normF = f.replace(/^\.\//, "");
-								return normF !== normRp && !editedPaths.has(f) && !editedPaths.has(normF) && !editedPaths.has("./" + normF);
-							});
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: `You have read \`${rp}\` ${cnt} times - stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` or \`write\` on a different file or stop."}` }],
-								timestamp: ((Date.now() - loopStart) / 1000),
-							});
-							break;
-						}
-					}
-					const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 6));
-					if (!hasProducedEdit && explorationCount >= dynamicExploreCeiling && pendingMessages.length === 0) {
-						pendingMessages.push({
-							role: "user",
-							content: [{ type: "text", text: `Context gathered (${explorationCount} reads/bashes). Apply your first file change (\`edit\` or \`write\`) to the highest-priority target now. A partial patch always outscores an empty diff.` }],
-							timestamp: ((Date.now() - loopStart) / 1000),
-						});
-						explorationCount = 0;
-					}
 				}
 			} else if (executionMode === "implement") {
 				// Simple per-plan for-loop:
@@ -2004,7 +2021,7 @@ async function runLoop(
 							type: "text",
 							text:
 								`You must call a tool. For the current plan (\`${currentPlan.path}\`), call \`read\`, \`edit\`, \`write\`, or \`editdone\` now. ` +
-								`Only \`edit\` and \`write\` may target \`${currentPlan.path}\`; plan-mode paths are for \`read\` only.`,
+								`\`edit\` and \`write\` must target the current plan file: \`${currentPlan.path}\`; plan-mode paths are for \`read\` only.`,
 						}],
 						timestamp: ((Date.now() - loopStart) / 1000),
 					});

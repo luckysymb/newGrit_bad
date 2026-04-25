@@ -10,8 +10,8 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 const MIN_PLAN_CHARS = 260;
 const MIN_PLAN_LINES = 4;
 const REQUIRED_PLAN_SECTIONS = ["Scope", "Edits", "Acceptance", "Verification"] as const;
-/** Real tasks almost always touch under 10 files; cap keeps plans from fragmenting into dozens of micro-edits. */
-const MAX_PLAN_ITEMS = 9;
+/** Real tasks almost always touch under 16 files; cap keeps plans from fragmenting into dozens of micro-edits. */
+const MAX_PLAN_ITEMS = 15;
 const planItemSchema = Type.Object(
 	{
 		path: Type.String({ description: "File path to edit in implementation mode" }),
@@ -36,10 +36,14 @@ const planSchema = Type.Object(
 		}),
 		plans: Type.Array(planItemSchema, {
 			description:
-				`Implementation plan items (each: target file, detailed edit instructions, is_new_file). Must be fewer than 10 entries — at most ${MAX_PLAN_ITEMS} files. If you planned more than 10 files, it means your plans are wrong. You should think about your plans again. Search on sibling directories for related files.`,
+				`Implementation plan items (each: target file, detailed edit instructions, is_new_file). Must be fewer than 16 entries — at most ${MAX_PLAN_ITEMS} files. If you planned more than 16 files, it means your plans are wrong. You should think about your plans again. Search on sibling directories for related files.`,
 			minItems: 1,
 			maxItems: MAX_PLAN_ITEMS,
 		}),
+		plan_mode_read_paths: Type.Optional(Type.Array(Type.String(), {
+			description:
+				"Optional helper paths from PLAN-mode reads. Used only by path guard to prefer exact-filename matches from already-read files.",
+		})),
 	},
 	{ additionalProperties: false },
 );
@@ -139,13 +143,14 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 		name: "plan",
 		label: "plan",
 		description:
-			`Submit PLAN->IMPLEMENT handoff JSON. Agent handshake: the **first** assistant turn that contains **only** this \`plan\` tool is a **draft** — the agent echoes your payload with a self-audit prompt and **does not** run validation yet. If you call **any** other tool on a later turn, that resets the handshake. The **second** assistant turn that contains **only** \`plan\` again runs full validation and may transition to IMPLEMENT. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. \`plans\` must be non-empty and have fewer than 10 items (at most ${MAX_PLAN_ITEMS}); each item must include all keys. The order of \`plans\` is load-bearing: implement mode iterates them sequentially and drops per-plan context after each one finishes, so submit them in dependency order (new leaf files first, consumers next, wiring/registration last).`,
+			`Submit PLAN->IMPLEMENT handoff JSON. Agent handshake: the **first** assistant turn that contains **only** this \`plan\` tool is a **draft** — the agent echoes your payload with a self-audit prompt and **does not** run validation yet. If you call **any** other tool on a later turn, that resets the handshake. The **second** assistant turn that contains **only** \`plan\` again runs full validation and may transition to IMPLEMENT. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. \`plans\` must be non-empty and have fewer than 16 items (at most ${MAX_PLAN_ITEMS}); each item must include all keys. The order of \`plans\` is load-bearing: implement mode iterates them sequentially and drops per-plan context after each one finishes, so submit them in dependency order (new leaf files first, consumers next, wiring/registration last).`,
 		promptSnippet:
 			"Call plan with exact JSON interface: { task_acceptance_criteria: [...], plans: [{ path, plan, acceptance_criteria, is_new_file }] }. Order plans in dependency order — leaf files first, wiring last.",
 		promptGuidelines: [
 			"Two-step handshake: first `plan`-only turn = draft echo (no validation). Any turn with a non-`plan` tool resets the handshake. Second consecutive `plan`-only turn = validated commit to IMPLEMENT.",
 			"Call plan only after broad and thorough exploration in plan mode",
-			`Submit fewer than 10 plan entries (at most ${MAX_PLAN_ITEMS} files). If you planned more than 10 files, it means your plans are wrong and you searched only a few files. Search more files on sibling directories for related files.`,
+			"When you make plan for a file, read that file first and then make the plan",
+			`Submit fewer than 16 plan entries (at most ${MAX_PLAN_ITEMS} files). If you planned more than 16 files, it means your plans are wrong and you searched only a few files. Search more files on sibling directories for related files.`,
 			"Include every target file needed to satisfy all acceptance criteria",
 			"Use exact interface keys: task_acceptance_criteria, path, plan, acceptance_criteria, is_new_file (no aliases)",
 			"Each plan item must declare which acceptance criteria it covers via acceptance_criteria",
@@ -160,6 +165,13 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 		prepareArguments: normalizePlanArgs,
 		async execute(_toolCallId, input: PlanToolInput) {
 			const cwd = process.cwd();
+			const planModeReadPaths = Array.isArray((input as any).plan_mode_read_paths)
+				? [...new Set(
+					((input as any).plan_mode_read_paths as unknown[])
+						.map((p) => (typeof p === "string" ? p.trim() : ""))
+						.filter((p) => p.length > 0),
+				)]
+				: [];
 			const normalizedTaskCriteria: string[] = [...new Set(
 				((input.task_acceptance_criteria as string[] | undefined) ?? [])
 					.map((c: string) => c.trim())
@@ -183,11 +195,12 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 			}
 			if (normalized.length > MAX_PLAN_ITEMS) {
 				throw new Error(
-					`plan must list fewer than 10 files: at most ${MAX_PLAN_ITEMS} plan items (got ${normalized.length}). You should think about your plans again. Search on sibling directories for related files.`,
+					`plan must list fewer than 16 files: at most ${MAX_PLAN_ITEMS} plan items (got ${normalized.length}). You should think about your plans again. Search on sibling directories for related files.`,
 				);
 			}
 			ensureShellValidationToolsAvailable();
 			const autoNormalizedExistingPaths: string[] = [];
+			const autoNormalizedReadPathFixes: Array<{ from: string; to: string }> = [];
 			const validationResults: PlanValidationResult[] = normalized.map((item) => {
 				const normalizedPlanText = addMissingRequiredSections(item.plan, item.acceptance_criteria);
 				if (item.acceptance_criteria.length === 0) {
@@ -244,6 +257,55 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 					};
 				}
 				const fileName = basename(item.path.replace(/\/+$/, ""));
+				// FIRST PASS (highest priority): a-z-only full-path normalization
+				// against PLAN-mode read paths.
+				// If exactly one read-path matches, auto-normalize immediately.
+				const alphaOnlyFullPathMatches = findAlphaOnlyFullPathMatchesInReadPaths(planModeReadPaths, item.path, 20);
+				if (alphaOnlyFullPathMatches.length === 1) {
+					const autoPath = alphaOnlyFullPathMatches[0];
+					const autoResolved = resolveWorkspacePath(autoPath, cwd, { kind: "file", basenameFallback: false });
+					const autoAbs = resolveToCwd(autoResolved, cwd);
+					if (fileExistsViaTest(autoAbs)) {
+						autoNormalizedReadPathFixes.push({ from: item.path, to: autoPath });
+						item.path = autoPath;
+						return {
+							path: item.path,
+							is_new_file: effectiveIsNewFile,
+							validation_result: "passed",
+							message: "passed: auto-normalized path from plan_mode_read_paths a-z-only full-path match",
+						};
+					}
+				}
+				// Flexible path guard order:
+				// 1) Prefer exact filename matches from PLAN-mode read paths.
+				//    - exactly one: auto-normalize and pass
+				//    - multiple: fail + suggest only those read paths
+				// 2) Only if zero, fall back to repo-wide basename search suggestions.
+				const readPathMatches = findFlexibleMatchesInReadPaths(planModeReadPaths, item.path, 20);
+				if (readPathMatches.length === 1) {
+					const autoPath = readPathMatches[0];
+					const autoResolved = resolveWorkspacePath(autoPath, cwd, { kind: "file", basenameFallback: false });
+					const autoAbs = resolveToCwd(autoResolved, cwd);
+					if (fileExistsViaTest(autoAbs)) {
+						autoNormalizedReadPathFixes.push({ from: item.path, to: autoPath });
+						item.path = autoPath;
+						return {
+							path: item.path,
+							is_new_file: effectiveIsNewFile,
+							validation_result: "passed",
+							message: "passed: auto-normalized path from plan_mode_read_paths exact filename match",
+						};
+					}
+				}
+				if (readPathMatches.length > 1) {
+					return {
+						path: item.path,
+						is_new_file: effectiveIsNewFile,
+						validation_result: "failed",
+						message: "failed: path not found; multiple exact filename matches found in plan_mode_read_paths",
+						suggested_paths: readPathMatches,
+					};
+				}
 				const suggestions = findPathsByBasenameViaFind(cwd, fileName, 20);
 				return {
 					path: item.path,
@@ -275,13 +337,18 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 			const normalizationNote = autoNormalizedExistingPaths.length > 0
 				? `Auto-normalization: set is_new_file=false for existing path(s): ${[...new Set(autoNormalizedExistingPaths)].join(", ")}\n`
 				: "";
+			const readPathFixNote = autoNormalizedReadPathFixes.length > 0
+				? `Auto-normalization from plan_mode_read_paths exact filename match:\n${autoNormalizedReadPathFixes
+					.map((f) => `- ${f.from} -> ${f.to}`)
+					.join("\n")}\n`
+				: "";
 			return {
 				content: [
 					{
 						type: "text",
 						text: allPassed
-							? `Plan validation passed for all ${normalized.length} file(s).\n${normalizationNote}Validation_result:\n${reportLines.join("\n")}`
-							: `Plan validation failed. Fix failed paths/criteria coverage and call plan again.\nEach plan item must be detailed and include sections: Scope:, Edits:, Acceptance:, Verification:.\n${normalizationNote}${!criteriaAllCovered ? `Uncovered acceptance criteria: ${uncoveredCriteria.slice(0, 10).join(" | ")}\n` : ""}Validation_result:\n${reportLines.join("\n")}`,
+							? `Plan validation passed for all ${normalized.length} file(s).\n${normalizationNote}${readPathFixNote}Validation_result:\n${reportLines.join("\n")}`
+							: `Plan validation failed. Fix failed paths/criteria coverage and call plan again.\nEach plan item must be detailed and include sections: Scope:, Edits:, Acceptance:, Verification:.\n${normalizationNote}${readPathFixNote}${!criteriaAllCovered ? `Uncovered acceptance criteria: ${uncoveredCriteria.slice(0, 15).join(" | ")}\n` : ""}Validation_result:\n${reportLines.join("\n")}`,
 					},
 				],
 				details: {
@@ -407,4 +474,75 @@ function findPathsByBasenameViaFind(repoRoot: string, fileName: string, maxMatch
 	const normalized: string[] = lines.map((line: string) => (line.startsWith("./") ? line.slice(2) : line));
 	const sorted = [...new Set<string>(normalized)].sort();
 	return sorted.slice(0, maxMatches);
+}
+
+function normalizeRepoRelativePath(p: string): string {
+	return p.trim().replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/");
+}
+
+function normalizePathAlphaOnly(p: string): string {
+	return normalizeRepoRelativePath(p).toLowerCase().replace(/[^a-z]/g, "");
+}
+
+/**
+ * FIRST-pass resolver requested by user:
+ * - Normalize requested path to a-z only
+ * - Normalize all planModeReadPaths to a-z only
+ * - Compare full normalized path strings
+ * Returns real read paths corresponding to matched normalized strings.
+ */
+function findAlphaOnlyFullPathMatchesInReadPaths(
+	planModeReadPaths: string[],
+	requestedPath: string,
+	maxMatches: number,
+): string[] {
+	const requestedAlpha = normalizePathAlphaOnly(requestedPath);
+	if (!requestedAlpha) return [];
+	const normalizedReadPaths = [...new Set(
+		planModeReadPaths
+			.map((p) => normalizeRepoRelativePath(p))
+			.filter((p) => p.length > 0),
+	)];
+	const matched = normalizedReadPaths
+		.filter((p) => normalizePathAlphaOnly(p) === requestedAlpha)
+		.sort();
+	return matched.slice(0, maxMatches);
+}
+
+/**
+ * Flexible read-path resolver with deterministic priority:
+ * 1) exact normalized path match
+ * 2) suffix match by normalized path segments
+ * 3) exact filename match (case-insensitive)
+ *
+ * Returns de-duplicated candidates ordered by score (higher first) and then lexicographically.
+ */
+function findFlexibleMatchesInReadPaths(
+	planModeReadPaths: string[],
+	requestedPath: string,
+	maxMatches: number,
+): string[] {
+	const requestedNorm = normalizeRepoRelativePath(requestedPath);
+	if (!requestedNorm) return [];
+	const requestedBase = basename(requestedNorm).toLowerCase();
+	const normalizedReadPaths = [...new Set(
+		planModeReadPaths
+			.map((p) => normalizeRepoRelativePath(p))
+			.filter((p) => p.length > 0),
+	)];
+	type Scored = { path: string; score: number };
+	const scored: Scored[] = [];
+	for (const p of normalizedReadPaths) {
+		let score = 0;
+		const pLower = p.toLowerCase();
+		const requestedLower = requestedNorm.toLowerCase();
+		if (pLower === requestedLower) score = 300;
+		else if (pLower.endsWith("/" + requestedLower) || requestedLower.endsWith("/" + pLower)) score = 200;
+		else if (basename(pLower) === requestedBase) score = 100;
+		if (score > 0) scored.push({ path: p, score });
+	}
+	return scored
+		.sort((a, b) => (b.score - a.score) || a.path.localeCompare(b.path))
+		.map((s) => s.path)
+		.slice(0, maxMatches);
 }
