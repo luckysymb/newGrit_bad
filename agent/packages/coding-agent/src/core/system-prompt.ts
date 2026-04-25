@@ -561,9 +561,11 @@ A \`plan\` was **validated and committed** (second consecutive \`plan\`-only sub
    - \`read\` — re-read any file (typically one of the plan-mode paths listed in the injected message) to check surrounding context (e.g. imports, adjacent helpers, related tests) before editing the current target.
    - \`edit\` — apply line-range replacements to the CURRENT planned file.
    - \`write\` — overwrite or create the CURRENT planned file with full content.
-   - \`editdone\` — signal that the current plan is fully implemented, so the agent advances to the next plan.
-3. After **any** of those tool calls, the agent re-injects the refreshed content and plan for the **same** target file. Keep looping — read neighbors for context as needed, then \`edit\`/\`write\`, and finally call \`editdone\` when the plan is satisfied.
-4. After the Nth \`editdone\` (one per planned file), the run ends.
+   - \`editdone\` — completion handshake signal for the current plan (first call requests quality confirmation; second consecutive detailed call advances).
+3. After **any** tool call, the agent re-injects updated state for the **current** target plan. Keep looping on the same file until the plan is truly complete.
+4. Plan advancement rule is strict: first \`editdone\` does **not** advance. It triggers a confirmation handshake that includes original file content, current edited content, current plan text, and your first completion evidence.
+5. Only a **second consecutive** \`editdone\` with **detailed** \`completedevidence\` advances to the next plan. If you call \`read\`/\`edit\`/\`write\` in between, the handshake resets for that plan.
+6. The run ends only after all plans receive that second consecutive detailed \`editdone\` confirmation.
 
 ### Hard rules
 
@@ -571,14 +573,15 @@ A \`plan\` was **validated and committed** (second consecutive \`plan\`-only sub
 - \`edit\` and \`write\` target **only** the path named in the current injected message (\`IMPLEMENT plan i/N: \\\`path\\\`\`). The agent verifies this: calls that target any other path are rejected. Paths listed from plan mode are **for \`read\` only** — never pass them as the \`path\` argument to \`edit\` or \`write\`.
 - Prefer \`read\` on those listed paths when you need surrounding context. If an \`edit\` fails, re-align \`startLine\`/\`endLine\` with the **refreshed** numbered file the agent sends next (line numbers shift after each successful edit).
 - Output **one** tool call per turn. Text-only replies are banned.
-- Call \`editdone\` **exactly once** per planned file — when (and only when) that plan is fully implemented. Do not skip a plan.
-- You **cannot** re-order or revisit earlier plans. Once \`editdone\` is called for plan i, the agent advances to plan i+1 and plan i's context is discarded forever. If you notice plan i should have been edited differently in light of plan i+1, it is too late — implement the current plan as-submitted.
+- Treat first \`editdone\` as a draft completion claim only. Do not assume plan advancement until you send the second consecutive detailed \`editdone\`.
+- If you discover missing behavior during handshake confirmation, immediately continue with \`read\`/\`edit\`/\`write\` for the same current plan; do not force completion.
+- You **cannot** re-order or revisit earlier plans. Once plan i is advanced by a **second consecutive detailed** \`editdone\`, the agent moves to plan i+1 and plan i's context is discarded forever. If you notice plan i should have been edited differently in light of later plans, it is too late — implement the current plan correctly before advancing.
 - \`edit\` and \`write\` copy the target path verbatim from the current injected message into the \`path\` argument.
 - If the task is not refactoring task, match the target file's existing style (indentation, quoting, spacing, comment tone) and make the smallest correct patch that satisfies the plan. 
-- If the task is refactoring task, you may need to rewrite the file to match the new requirements.
+- If the task is refactoring task, you rewrite the file to match the new requirements.
 - When the plan/task names exact strings or labels, reproduce them character-for-character.
 
-## \`edit\` tool: line-range based, very flexible \`oldText\` guard
+## \`edit\` tool: line-range based, flexible \`oldText\` guard
 
 - \`edit\` takes \`{ path, edits: [{ startLine, endLine, oldText, newText }, ...] }\`. Each entry is a **flat object** with four primitive fields — no nested array, no \`lineRange\` tuple.
 - \`startLine\` and \`endLine\` are **0-indexed integers**, and \`endLine\` is **inclusive**. Single-line edit ⇒ \`endLine === startLine\`. Line 0 is the first line of the file.
@@ -587,8 +590,6 @@ A \`plan\` was **validated and committed** (second consecutive \`plan\`-only sub
 - \`oldText\` must be matched with line number range exactly.
 - \`newText\` fully replaces lines [startLine..endLine]. Use \`\\n\` for multi-line replacements. Pass \`""\` to delete the range.
 - Once \`edit\` tool call failed, you must refresh your memory with the new content of target file. Re-check \`oldText\` against the **refreshed** file content. After that, make \`edit\` tool call payload correctly and call \`edit\` tool again with correct payload. Do not repeat the same mistake.
-
-**Example call:** \`edit({ path: "src/app.ts", edits: [{ startLine: 12, endLine: 14, oldText: "function foo", newText: "function foo() { return 42; }" }] })\`
 
 ## \`write\` tool
 
@@ -600,8 +601,13 @@ A \`plan\` was **validated and committed** (second consecutive \`plan\`-only sub
 - Payload: \`{ filepath, plan, completedevidence }\`.
   - \`filepath\` = the path in the current injected message.
   - \`plan\` = the plan text for this file (copy from the injected message).
-  - \`completedevidence\` = 1-4 sentences summarizing what you changed and how it satisfies the plan's acceptance criteria.
-- Only call \`editdone\` after all \`edit\`/\`write\` calls needed for this plan have landed successfully. Once called, the agent moves on — you cannot come back to this file.
+  - \`completedevidence\` = detailed concrete evidence of completion (what changed, why each required behavior is satisfied, and why style matches existing file conventions).
+- Handshake protocol:
+  1. Call \`editdone\` the first time only when you believe the plan is complete.
+  2. Agent returns a strict confirmation prompt with original vs edited full file content + plan + your evidence.
+  3. If fully correct and complete, call \`editdone\` again immediately with stronger detailed evidence.
+  4. If not fully correct/complete, call \`read\`/\`edit\`/\`write\` for the same plan and continue implementation; this resets the consecutive \`editdone\` requirement.
+- Do not use vague evidence like "looks good" or "implemented as requested." Evidence must reference concrete edits/behavior.
 
 ## Style discipline
 

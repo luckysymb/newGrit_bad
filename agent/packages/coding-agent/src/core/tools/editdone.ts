@@ -8,10 +8,14 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
  * `editdone` is a pure signalling tool used in implement mode.
  *
  * The agent loop iterates planned files one-by-one. For each plan the model
- * applies `edit`/`write` calls until it is satisfied, then calls `editdone`
- * with a short evidence blurb. The agent loop consumes the `editdone` call
- * to advance to the next plan; after the Nth `editdone` (= plan count) the
- * run ends.
+ * applies `edit`/`write` calls until it is satisfied, then calls `editdone`.
+ * The first `editdone` is a draft completion claim: the loop sends a strict
+ * confirmation handshake (original file content, edited content, plan text,
+ * and evidence) and asks the model to either:
+ *   - call `editdone` again with stronger detailed evidence, or
+ *   - continue implementation via `read`/`edit`/`write`.
+ * Only a second consecutive detailed `editdone` advances to the next plan.
+ * The run ends only after that handshake completes for every planned file.
  *
  * The tool itself performs no filesystem work — it just echoes back a
  * confirmation message. All state transitions happen in the agent loop.
@@ -26,7 +30,7 @@ const editdoneSchema = Type.Object(
 		}),
 		completedevidence: Type.String({
 			description:
-				"Short explanation (1-4 sentences) of why this plan is fully implemented — what edits were applied and how they satisfy the plan's acceptance criteria.",
+				"Detailed completion evidence: concrete symbols/behaviors changed, why the plan is fully satisfied, and why style matches surrounding code. Used by the per-plan two-step editdone handshake.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -48,12 +52,16 @@ export function createEditDoneToolDefinition(): ToolDefinition<
 		name: "editdone",
 		label: "editdone",
 		description:
-			"Signal that the CURRENT plan is fully implemented. Call this ONLY in implement mode, and only after you have applied all `edit`/`write` calls needed for the current planned file. Required payload: { filepath, plan, completedevidence }. Calling `editdone` advances the agent to the next planned file (or ends the run after the last plan).",
-		promptSnippet: "Signal completion of the current plan. Required: { filepath, plan, completedevidence }.",
+			"Signal completion in IMPLEMENT mode for the CURRENT planned file. This tool uses a two-step handshake: first `editdone` triggers strict confirmation; only a second consecutive detailed `editdone` advances to the next plan. Required payload: { filepath, plan, completedevidence }.",
+		promptSnippet:
+			"IMPLEMENT handshake signal. Required: { filepath, plan, completedevidence }. First call = draft claim; second consecutive detailed call = advance.",
 		promptGuidelines: [
-			"Only call `editdone` after you finished applying edits for the current planned file.",
+			"Only call `editdone` for the current planned file in IMPLEMENT mode.",
 			"`filepath` and `plan` must match the plan the agent is currently asking you to implement.",
-			"`completedevidence` is a short justification of completion — summarize what you changed and why it satisfies the plan.",
+			"First `editdone` does not advance; it triggers a strict self-audit handshake in agent-loop.",
+			"If the handshake reveals missing work, continue with `read`/`edit`/`write` for the same plan.",
+			"Only the second consecutive `editdone` with detailed `completedevidence` advances the plan.",
+			"`completedevidence` must be concrete and specific (symbols/logic/behavior/style), not vague.",
 		],
 		parameters: editdoneSchema,
 		async execute(_toolCallId, input: EditDoneToolInput) {
@@ -63,7 +71,11 @@ export function createEditDoneToolDefinition(): ToolDefinition<
 				content: [
 					{
 						type: "text" as const,
-						text: `editdone received for \`${filepath}\`. Evidence: ${completedevidence || "(none)"}`,
+						text:
+							`editdone received for \`${filepath}\`.\n` +
+							`This is an IMPLEMENT handshake signal (state transitions happen in agent-loop).\n` +
+							`If this is the first editdone for the current plan, agent-loop will request strict confirmation.\n` +
+							`Evidence: ${completedevidence || "(none)"}`,
 					},
 				],
 				details: { filepath, completedevidence },

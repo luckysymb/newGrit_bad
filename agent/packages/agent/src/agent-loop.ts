@@ -574,6 +574,14 @@ async function runLoop(
 	 */
 	const plannedOrder: Array<{ path: string; plan: string }> = [];
 	let currentPlanIndex = 0;
+	/** Per-plan snapshot of file content at the moment that plan starts. */
+	const originalContentByPlanIndex = new Map<number, string>();
+	/**
+	 * Handshake state for editdone:
+	 * first editdone -> send confirmation inject;
+	 * second consecutive detailed editdone on same plan -> advance.
+	 */
+	let pendingEditdoneConfirmationPlanIndex: number | null = null;
 	/**
 	 * Timestamp (ms) when the current plan started being worked on. Reset every
 	 * time `currentPlanIndex` advances (on `editdone` or budget-auto-advance) and
@@ -709,6 +717,89 @@ async function runLoop(
 			currentPlanStartedAt,
 			budgetMs,
 		);
+	};
+
+	const readCurrentFileContent = (filepath: string): string => {
+		try {
+			const { abs, ok } = safeResolvePathUnderCwd(filepath);
+			if (ok && existsSync(abs)) return readFileSync(abs, "utf8");
+		} catch {
+			// best effort
+		}
+		return "";
+	};
+
+	const ensurePlanOriginalSnapshot = (planIdx: number): void => {
+		if (planIdx < 0 || planIdx >= plannedOrder.length) return;
+		if (originalContentByPlanIndex.has(planIdx)) return;
+		const p = plannedOrder[planIdx];
+		originalContentByPlanIndex.set(planIdx, readCurrentFileContent(p.path));
+	};
+
+	const buildEditdoneConfirmationInjectMessage = (
+		planIdx: number,
+		completedevidence: string,
+	): AgentMessage | null => {
+		if (planIdx < 0 || planIdx >= plannedOrder.length) return null;
+		const p = plannedOrder[planIdx];
+		const original = originalContentByPlanIndex.get(planIdx) ?? "";
+		const edited = readCurrentFileContent(p.path);
+		const originalNumbered = original.length > 0
+			? formatFileWithZeroIndexedLines(original)
+			: "(file did not exist when this plan started)";
+		const editedNumbered = edited.length > 0
+			? formatFileWithZeroIndexedLines(edited)
+			: "(file currently missing)";
+		const body =
+			`IMPLEMENT plan ${planIdx + 1}/${plannedOrder.length} EDITDONE HANDSHAKE CONFIRMATION: \`${p.path}\`\n\n` +
+			`You just called \`editdone\`. Confirm completion quality against this evidence before plan can advance.\n\n` +
+			`Current plan text:\n---\n${p.plan || "(no plan text)"}\n---\n\n` +
+			`First editdone completedevidence:\n---\n${completedevidence || "(empty)"}\n---\n\n` +
+			`Original target file content at plan start:\n` +
+			"```\n\n" +
+			escapeMarkdownFences(originalNumbered) +
+			"\n```\n\n" +
+			`Edited target file content now:\n` +
+			"```\n\n" +
+			escapeMarkdownFences(editedNumbered) +
+			"\n```\n\n" +
+			`## IMPLEMENT MODE - EDITDONE QUALITY HANDSHAKE (NOT advanced yet)\n\n` +
+			`Your first \`editdone\` call is treated as a draft completion claim only. The plan does NOT advance until you pass this self-audit and then call a second consecutive \`editdone\` with detailed evidence.\n\n` +
+			`### Non-negotiable completion contract for this file\n` +
+			`- **Plan lock:** You must satisfy the current plan exactly as written for \`${p.path}\`. Do not broaden scope; do not skip any promised behavior.\n` +
+			`- **No hidden TODOs:** Any promised behavior that is not concretely implemented in the edited file is a failure of completion.\n` +
+			`- **Correctness over optimism:** If any uncertainty remains, continue implementing now via \`read\`/\`edit\`/\`write\`; do not advance with a weak \`editdone\`.\n` +
+			`- **Style consistency is mandatory:** Match local naming, formatting, control-flow style, error-handling conventions, and surrounding code patterns from the original file.\n` +
+			`- **Critical:** Add blank line as my as possible. It doesn't reduce matched lines. When you add blank line, just COPY the blank line of original file.\n\n` +
+			`### Mandatory self-review checklist (answer internally YES/NO)\n` +
+			`1. **Plan coverage:** Did you implement every required edit in the plan text (not just part of it)?\n` +
+			`2. **Behavioral completeness:** Are success path, failure path, and edge handling required by the plan actually present now?\n` +
+			`3. **Code-level precision:** Are exact symbols, literals, branches, and data shapes aligned with what the plan demands?\n` +
+			`4. **No regressions:** Did this change avoid breaking unrelated behavior in this file's existing logic?\n` +
+			`5. **Style matching:** Does the edited file read like a natural continuation of the original coding style?\n` +
+			`6. **Evidence quality:** Can you provide specific before/after evidence tied to concrete lines and logic changes (not vague claims)?\n` +
+			`7. **Implement-mode discipline:** If any answer is NO, will you continue with a read/edit/write tool call now instead of forcing completion?\n\n` +
+			`### Evidence standard for second \`editdone\`\n` +
+			`Your second \`editdone\` \`completedevidence\` must be detailed and concrete. Include:\n` +
+			`- exact changes made (symbols/blocks/branches touched)\n` +
+			`- why those changes satisfy each required part of this plan\n` +
+			`- why style and structure remain consistent with the original file\n` +
+			`- why no remaining work is needed for this plan\n\n` +
+			`### Call exactly ONE tool now\n` +
+			`- If and only if all checklist items pass: call \`editdone\` again with detailed completedevidence. Only this second consecutive detailed \`editdone\` advances to the next plan.\n` +
+			`- Otherwise: call \`read\`, \`edit\`, or \`write\` now to finish missing work for the current plan.\n`;
+		return {
+			role: "user",
+			content: [{ type: "text", text: body }],
+			timestamp: ((Date.now() - loopStart) / 1000),
+		};
+	};
+
+	const isDetailedCompletionEvidence = (text: string): boolean => {
+		const t = text.trim();
+		if (t.length < 60) return false;
+		const wordCount = t.split(/\s+/).filter((w) => w.length > 0).length;
+		return wordCount >= 12;
 	};
 
 	/**
@@ -1315,7 +1406,6 @@ async function runLoop(
 	/** If identical tool-call signatures repeat with no new successful mutations, force-stop to preserve diff. */
 	const REPEATED_TOOL_SIGNATURE_LIMIT = 3;
 	let multiFileHintSent = false;
-	let reviewPassDone = false;
 	let successfulMutationCount = 0;
 	let lastToolSignature = "";
 	let repeatedToolSignatureCount = 0;
@@ -2015,6 +2105,9 @@ async function runLoop(
 						}
 						currentPlanIndex = 0;
 						currentPlanStartedAt = Date.now();
+						originalContentByPlanIndex.clear();
+						pendingEditdoneConfirmationPlanIndex = null;
+						ensurePlanOriginalSnapshot(currentPlanIndex);
 						// Freeze the "stable prefix" for implement mode: everything in
 						// `currentContext.messages` up to this point (the task,
 						// discovery, `plan` tool call + result) will always be preserved
@@ -2101,21 +2194,45 @@ async function runLoop(
 
 				// Did the model signal the current plan is done?
 				const hasEditdone = toolCalls.some((tc) => tc.name === "editdone");
+				// "Twice in a row" semantics: any non-editdone turn resets pending confirmation.
+				if (!hasEditdone && pendingEditdoneConfirmationPlanIndex === currentPlanIndex) {
+					pendingEditdoneConfirmationPlanIndex = null;
+				}
 				if (hasEditdone) {
-					const completedPlanIndex = currentPlanIndex;
-					currentPlanIndex++;
-					currentPlanStartedAt = Date.now();
-					if (currentPlanIndex >= plannedOrder.length) {
+					const firstEditdoneCall = toolCalls.find((tc) => tc.name === "editdone");
+					const firstEditdoneArgs = (firstEditdoneCall?.arguments ?? {}) as Record<string, unknown>;
+					const evidence =
+						typeof firstEditdoneArgs.completedevidence === "string"
+							? firstEditdoneArgs.completedevidence
+							: "";
+					const evidenceDetailed = isDetailedCompletionEvidence(evidence);
+					const isSecondConsecutiveDetailedEditdone =
+						pendingEditdoneConfirmationPlanIndex === currentPlanIndex && evidenceDetailed;
+
+					if (isSecondConsecutiveDetailedEditdone) {
+						const completedPlanIndex = currentPlanIndex;
+						pendingEditdoneConfirmationPlanIndex = null;
+						currentPlanIndex++;
+						currentPlanStartedAt = Date.now();
+						if (currentPlanIndex >= plannedOrder.length) {
+							await emit({ type: "turn_end", message, toolResults });
+							await emit({ type: "agent_end", messages: newMessages });
+							return;
+						}
+						ensurePlanOriginalSnapshot(currentPlanIndex);
+						// Drop the just-completed plan's iteration from context so the next
+						// plan starts with the stable PLAN-mode prefix + one fresh inject.
 						await emit({ type: "turn_end", message, toolResults });
-						await emit({ type: "agent_end", messages: newMessages });
-						return;
+						resetToImplementModeBase("editdone_advance", completedPlanIndex);
+						const nextMsg = buildCurrentPlanInjectMessage();
+						if (nextMsg) queueImplementInjectMessage(nextMsg);
+						continue;
 					}
-					// Drop the just-completed plan's iteration from context so the next
-					// plan starts with the stable PLAN-mode prefix + one fresh inject.
+
+					pendingEditdoneConfirmationPlanIndex = currentPlanIndex;
 					await emit({ type: "turn_end", message, toolResults });
-					resetToImplementModeBase("editdone_advance", completedPlanIndex);
-					const nextMsg = buildCurrentPlanInjectMessage();
-					if (nextMsg) queueImplementInjectMessage(nextMsg);
+					const confirmMsg = buildEditdoneConfirmationInjectMessage(currentPlanIndex, evidence);
+					if (confirmMsg) queueImplementInjectMessage(confirmMsg);
 					continue;
 				}
 
@@ -2161,6 +2278,7 @@ async function runLoop(
 							budget_ms: planBudget,
 						});
 						const abandonedPlanIndex = currentPlanIndex;
+						pendingEditdoneConfirmationPlanIndex = null;
 						currentPlanIndex++;
 						currentPlanStartedAt = Date.now();
 						if (currentPlanIndex >= plannedOrder.length) {
@@ -2172,6 +2290,7 @@ async function runLoop(
 						// starts from the clean PLAN-mode prefix.
 						await emit({ type: "turn_end", message, toolResults });
 						resetToImplementModeBase("plan_budget_exceeded", abandonedPlanIndex);
+						ensurePlanOriginalSnapshot(currentPlanIndex);
 						const skipMsg = buildCurrentPlanInjectMessage();
 						if (skipMsg) queueImplementInjectMessage(skipMsg);
 						continue;
