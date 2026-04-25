@@ -1015,7 +1015,11 @@ async function runLoop(
 
 		const hasPlan = calls.some((tc) => tc.name === "plan");
 		const onlyPlan = hasPlan && calls.every((tc) => tc.name === "plan");
-		const useRealPlanValidation = onlyPlan && planHandshakeAwaitingConsecutivePlanOnly;
+		const planBypassExceeded = (Date.now() - loopStart) >= PLAN_MODE_BYPASS_MS;
+		// Timeout override: once PLAN budget is exceeded, a plan-only turn should
+		// execute real plan validation immediately (skip draft-confirmation gate).
+		const useRealPlanValidation =
+			onlyPlan && (planHandshakeAwaitingConsecutivePlanOnly || planBypassExceeded);
 
 		const results: ToolResultMessage[] = [];
 		for (const toolCall of calls) {
@@ -1144,7 +1148,11 @@ async function runLoop(
 		}
 		return missing;
 	};
-	const PLAN_MODE_MAX_MS = 100_000;
+	// PLAN timing policy (exactly two thresholds):
+	// 1) 100s warning/escalation
+	// 2) 150s bypass (accept latest plan turn without strict confirmation gate)
+	const PLAN_MODE_WARNING_MS = 100_000;
+	const PLAN_MODE_BYPASS_MS = 150_000;
 	const IMPLEMENT_VERIFY_MAX_MS = 200_000;
 	const IMPLEMENT_READ_ONLY_REQUIRED_TURN_LIMIT = 3;
 
@@ -1555,8 +1563,8 @@ async function runLoop(
 						: currentContext.tauSystemPrompts.implement
 					: currentContext.systemPrompt;
 
-			const planBudgetExceeded =
-				executionMode === "plan" && !planSubmitted && (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
+			const planWarningExceeded =
+				executionMode === "plan" && !planSubmitted && (Date.now() - loopStart) >= PLAN_MODE_WARNING_MS;
 
 			const message = await streamAssistantResponse(
 				currentContext,
@@ -1569,7 +1577,7 @@ async function runLoop(
 					// IMPLEMENT mode: force a tool call so the model must emit edit / write / editdone.
 					toolChoice:
 						executionMode === "plan" && !planSubmitted
-							? planBudgetExceeded
+							? planWarningExceeded
 								? ({ type: "function", function: { name: "plan" } } as const)
 								: ("required" as const)
 							: executionMode === "implement"
@@ -1619,7 +1627,7 @@ async function runLoop(
 			const hasPlanToolCall = toolCalls.some((tc) => tc.name === "plan");
 			const toolResults: ToolResultMessage[] = [];
 			if (executionMode === "plan") {
-				if (hasPlanToolCall && expectedFiles.length > 0 && !planBudgetExceeded) {
+				if (hasPlanToolCall && expectedFiles.length > 0 && !planWarningExceeded) {
 					const undiscovered = undiscoveredExpectedFiles();
 					if (undiscovered.length > 0) {
 						await emit({ type: "turn_end", message, toolResults: [] });
@@ -1671,7 +1679,7 @@ async function runLoop(
 						continue;
 					}
 				}
-				if ((Date.now() - loopStart) >= PLAN_MODE_MAX_MS && pendingMessages.length === 0 && !hasPlanToolCall) {
+				if ((Date.now() - loopStart) >= PLAN_MODE_WARNING_MS && pendingMessages.length === 0 && !hasPlanToolCall) {
 					await emit({ type: "turn_end", message, toolResults: [] });
 					pendingMessages.push({
 						role: "user",
@@ -1820,34 +1828,39 @@ async function runLoop(
 						if (planEchoDetails?.planDraftEcho === true) {
 							continue;
 						}
-						const planTimeoutExceeded = (Date.now() - loopStart) >= PLAN_MODE_MAX_MS;
+						const planBypassExceeded = (Date.now() - loopStart) >= PLAN_MODE_BYPASS_MS;
 						if (tr.isError) {
 							const errText = tr.content?.map((c: any) => c?.text ?? "").join("") ?? "unknown plan validation error";
 							await emitRolloutMarker("plan_validation_error", {
 								error: errText,
 							});
-							pendingMessages.push({
-								role: "user",
-								content: [{
-									type: "text",
-									text:
-										`PLAN mode remediation: your \`plan\` call failed validation and cannot transition to IMPLEMENT yet.\n` +
-										`${planTimeoutExceeded
-											? `PLAN timeout reached; submit a corrected \`plan\` now.`
-											: `Stay in PLAN mode and submit a corrected \`plan\`.`}\n` +
-										`Validator error:\n${errText}\n\n` +
-										`Fix checklist (do all):\n` +
-										`1) Use exact payload keys: \`task_acceptance_criteria\`, \`plans\`, and for each plan item: \`path\`, \`plan\`, \`acceptance_criteria\`, \`is_new_file\`.\n` +
-										`2) Ensure \`plans\` is non-empty and under the max file cap.\n` +
-										`3) Ensure each \`plans[].acceptance_criteria\` is non-empty and maps to official task criteria.\n` +
-										`4) Ensure each \`plans[].plan\` is implement-ready with explicit \`Scope:\`, \`Edits:\`, \`Acceptance:\`, \`Verification:\`.\n` +
-										`5) Ensure every \`plans[].path\` is an EXACT verbatim path proven by \`ls\`/\`find\`/\`grep\` output (no guessed paths).\n` +
-										`6) Ensure \`is_new_file\` is correct for each path.\n\n` +
-										`Then call \`plan\` again (tool call only).`,
-								}],
-								timestamp: ((Date.now() - loopStart) / 1000),
-							});
-							continue;
+							if (planBypassExceeded) {
+								await emitRolloutMarker("plan_validation_timeout_bypass", {
+									reason: "tool_error",
+									error: errText,
+								});
+							} else {
+								pendingMessages.push({
+									role: "user",
+									content: [{
+										type: "text",
+										text:
+											`PLAN mode remediation: your \`plan\` call failed validation and cannot transition to IMPLEMENT yet.\n` +
+											`Stay in PLAN mode and submit a corrected \`plan\`.\n` +
+											`Validator error:\n${errText}\n\n` +
+											`Fix checklist (do all):\n` +
+											`1) Use exact payload keys: \`task_acceptance_criteria\`, \`plans\`, and for each plan item: \`path\`, \`plan\`, \`acceptance_criteria\`, \`is_new_file\`.\n` +
+											`2) Ensure \`plans\` is non-empty and under the max file cap.\n` +
+											`3) Ensure each \`plans[].acceptance_criteria\` is non-empty and maps to official task criteria.\n` +
+											`4) Ensure each \`plans[].plan\` is implement-ready with explicit \`Scope:\`, \`Edits:\`, \`Acceptance:\`, \`Verification:\`.\n` +
+											`5) Ensure every \`plans[].path\` is an EXACT verbatim path proven by \`ls\`/\`find\`/\`grep\` output (no guessed paths).\n` +
+											`6) Ensure \`is_new_file\` is correct for each path.\n\n` +
+											`Then call \`plan\` again (tool call only).`,
+									}],
+									timestamp: ((Date.now() - loopStart) / 1000),
+								});
+								continue;
+							}
 						}
 						const planDetails = (tr as any)?.details as {
 							allPassed?: boolean;
@@ -1874,31 +1887,37 @@ async function runLoop(
 								failedPaths.length > 0
 									? "Check the suggested filepaths first. If there isn't the right path what you really target, then discover the file again. Don't call plan tool again without wrong path correction."
 									: "";
-							pendingMessages.push({
-								role: "user",
-								content: [{
-									type: "text",
-									text:
-										`PLAN mode remediation: plan validation failed. Stay in PLAN mode.\n` +
-										`${failedPathNudge ? `${failedPathNudge}\n` : ""}` +
-										`${uncovered ? `${uncovered}\n` : ""}` +
-										`Detailed validator results:\n${preview}\n\n` +
-										`Required correction before next \`plan\` call:\n` +
-										`- Correct every failed path using EXACT verbatim discovery-proven paths only (\`ls\`/\`find\`/\`grep\` output), or set \`is_new_file\` appropriately.\n` +
-										`${strictPathCorrectionInstruction ? `- ${strictPathCorrectionInstruction}\n` : ""}` +
-										`- Ensure criteria coverage is complete and correctly mapped.\n` +
-										`- Keep each plan item fully implementable (no ambiguity in \`Edits:\`).\n` +
-										`- Re-submit one corrected \`plan\` payload.`,
-								}],
-								timestamp: ((Date.now() - loopStart) / 1000),
+							if (!planBypassExceeded) {
+								pendingMessages.push({
+									role: "user",
+									content: [{
+										type: "text",
+										text:
+											`PLAN mode remediation: plan validation failed. Stay in PLAN mode.\n` +
+											`${failedPathNudge ? `${failedPathNudge}\n` : ""}` +
+											`${uncovered ? `${uncovered}\n` : ""}` +
+											`Detailed validator results:\n${preview}\n\n` +
+											`Required correction before next \`plan\` call:\n` +
+											`- Correct every failed path using EXACT verbatim discovery-proven paths only (\`ls\`/\`find\`/\`grep\` output), or set \`is_new_file\` appropriately.\n` +
+											`${strictPathCorrectionInstruction ? `- ${strictPathCorrectionInstruction}\n` : ""}` +
+											`- Ensure criteria coverage is complete and correctly mapped.\n` +
+											`- Keep each plan item fully implementable (no ambiguity in \`Edits:\`).\n` +
+											`- Re-submit one corrected \`plan\` payload.`,
+									}],
+									timestamp: ((Date.now() - loopStart) / 1000),
+								});
+								continue;
+							}
+							await emitRolloutMarker("plan_validation_timeout_bypass", {
+								reason: "details_not_all_passed",
+								failed_paths: failedPaths,
 							});
-							continue;
 						}
 						const plans = extractPlanItems(tc.arguments);
 						await emitRolloutMarker("plan_extracted", {
 							plans,
 						});
-						if (plans.length === 0 && !planTimeoutExceeded) {
+						if (plans.length === 0 && !planBypassExceeded) {
 							pendingMessages.push({
 								role: "user",
 								content: [{ type: "text", text: "Plan submission was empty or malformed. Stay in PLAN mode and call `plan` with exact JSON format. Plans must be detailed." }],
@@ -1909,12 +1928,19 @@ async function runLoop(
 						const submittedPlanPaths = new Set<string>(plans.map((p) => (typeof p?.path === "string" ? normalizePathForMatch(p.path.trim()) : "")).filter((p) => p.length > 0));
 						const missingRequiredInPlan = missingRequiredFromPlan(submittedPlanPaths);
 						if (missingRequiredInPlan.length > 0) {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: `Plan coverage incomplete in PLAN mode. Missing required files in \`plan\`: ${missingRequiredInPlan.slice(0, 12).map((f) => `\`${f}\``).join(", ")}. Add them and call \`plan\` again before transition.` }],
-								timestamp: ((Date.now() - loopStart) / 1000),
-							});
-							continue;
+							if (planBypassExceeded) {
+								await emitRolloutMarker("plan_validation_timeout_bypass", {
+									reason: "missing_required_paths",
+									missing_required_in_plan: missingRequiredInPlan,
+								});
+							} else {
+								pendingMessages.push({
+									role: "user",
+									content: [{ type: "text", text: `Plan coverage incomplete in PLAN mode. Missing required files in \`plan\`: ${missingRequiredInPlan.slice(0, 12).map((f) => `\`${f}\``).join(", ")}. Add them and call \`plan\` again before transition.` }],
+									timestamp: ((Date.now() - loopStart) / 1000),
+								});
+								continue;
+							}
 						}
 						for (const p of plans) {
 							if (typeof p?.path !== "string" || p.path.trim().length === 0) continue;
@@ -1968,6 +1994,18 @@ async function runLoop(
 						planHandshakeAwaitingConsecutivePlanOnly = false;
 						executionMode = "implement";
 						implementModeStartedAt = Date.now();
+						if (planBypassExceeded) {
+							pendingMessages.push({
+								role: "user",
+								content: [{
+									type: "text",
+									text:
+										"PLAN timeout bypass triggered (~150s). Mode is now changed into IMPLEMENT automatically using the latest submitted plan. " +
+										"These plans might not be perfect — implement them as-is and proceed file-by-file.",
+								}],
+								timestamp: ((Date.now() - loopStart) / 1000),
+							});
+						}
 						// Build the ordered plan list that drives the implement-mode for-loop.
 						plannedOrder.length = 0;
 						for (const p of plans) {
