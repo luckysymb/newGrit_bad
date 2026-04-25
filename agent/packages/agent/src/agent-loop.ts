@@ -21,6 +21,13 @@ import type {
 	AgentToolResult,
 	StreamFn,
 } from "./types.js";
+import {
+	buildPlanDiscoveryStepsFromToolBatch,
+	isPlanDiscoveryToolName,
+	mergePlanDiscoverySteps,
+	stepsToPlanDiscoveryMessages,
+	type PlanDiscoveryStep,
+} from "./plan-discovery-steps.js";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import type { Dirent } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -489,6 +496,17 @@ async function runLoop(
 	let firstTurn = true;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+	/**
+	 * PLAN mode only: committed prefix + deduped discovery steps rebuild
+	 * `currentContext.messages` so duplicate discovery payloads drop older spans
+	 * without breaking tool_call_id pairing.
+	 */
+	const parentBaselineCount = currentContext.messages.length - newMessages.length;
+	const planModeHead: AgentMessage[] = [...currentContext.messages];
+	let planDiscoverySteps: PlanDiscoveryStep[] = [];
+	const PLAN_DISCOVERY_DUPLICATE_STREAK_LIMIT = 3;
+	let planDiscoveryDuplicateOnlyStreak = 0;
 
 	let upstreamRetries = 0;
 	const UPSTREAM_RETRY_LIMIT = 100;
@@ -1209,6 +1227,45 @@ async function runLoop(
 		await emit({ type: "message_start", message: markerMessage });
 		await emit({ type: "message_end", message: markerMessage });
 	};
+
+	const commitPlanModeMessages = (): void => {
+		currentContext.messages = [...planModeHead, ...stepsToPlanDiscoveryMessages(planDiscoverySteps)];
+		newMessages.splice(0, newMessages.length, ...currentContext.messages.slice(parentBaselineCount));
+	};
+	const flushDiscoveryStepsIntoPlanHead = (): void => {
+		if (planDiscoverySteps.length === 0) return;
+		planModeHead.push(...stepsToPlanDiscoveryMessages(planDiscoverySteps));
+		planDiscoverySteps.length = 0;
+	};
+	const appendPlanModeNonDiscoveryTurn = (assistant: AssistantMessage, results: ToolResultMessage[]): void => {
+		flushDiscoveryStepsIntoPlanHead();
+		planModeHead.push(assistant, ...results);
+		commitPlanModeMessages();
+	};
+	const appendPlanModeDiscoveryDeduped = (
+		assistant: AssistantMessage,
+		calls: AgentToolCall[],
+		results: ToolResultMessage[],
+	): { batchSize: number; replacedCount: number } => {
+		const batch = buildPlanDiscoveryStepsFromToolBatch(assistant, calls, results);
+		const { steps: next, replacedKeys } = mergePlanDiscoverySteps(planDiscoverySteps, batch);
+		planDiscoverySteps = next;
+		if (replacedKeys.length > 0) {
+			void emitRolloutMarker("plan_discovery_context_deduped", {
+				replaced_canonical_keys: replacedKeys,
+				batch_tool_calls: batch.length,
+			});
+		}
+		commitPlanModeMessages();
+		return { batchSize: batch.length, replacedCount: replacedKeys.length };
+	};
+	const appendPlanModeAssistantOnly = (assistant: AssistantMessage): void => {
+		flushDiscoveryStepsIntoPlanHead();
+		planModeHead.push(assistant);
+		commitPlanModeMessages();
+	};
+	commitPlanModeMessages();
+
 	const criterionNeedsFile = (criterion: CriterionLedgerItem, filePath: string): boolean => {
 		const f = normalizePathForMatch(filePath);
 		return criterion.requiredFiles.some((rf) => {
@@ -1636,13 +1693,23 @@ async function runLoop(
 				{
 					pendingMessages = pendingMessages.filter((m) => !isPlanSteeringMessage(m));
 				}
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
+				if (executionMode === "plan") {
+					for (const message of pendingMessages) {
+						await emit({ type: "message_start", message });
+						await emit({ type: "message_end", message });
+						planModeHead.push(message);
+					}
+					pendingMessages = [];
+					commitPlanModeMessages();
+				} else {
+					for (const message of pendingMessages) {
+						await emit({ type: "message_start", message });
+						await emit({ type: "message_end", message });
+						currentContext.messages.push(message);
+						newMessages.push(message);
+					}
+					pendingMessages = [];
 				}
-				pendingMessages = [];
 			}
 
 			// Stream assistant response
@@ -1656,6 +1723,22 @@ async function runLoop(
 			const planWarningExceeded =
 				executionMode === "plan" && !planSubmitted && (Date.now() - loopStart) >= PLAN_MODE_WARNING_MS;
 
+			let streamToolChoice:
+				| "auto"
+				| "none"
+				| "required"
+				| { type: "function"; function: { name: string } }
+				| undefined;
+			if (executionMode === "plan") {
+				if (!planSubmitted) {
+					streamToolChoice = (planWarningExceeded)
+						? ({ type: "function", function: { name: "plan" } } as const)
+						: ("required" as const);
+				}
+			} else if (executionMode === "implement") {
+				streamToolChoice = "required" as const;
+			}
+
 			const message = await streamAssistantResponse(
 				currentContext,
 				config,
@@ -1663,22 +1746,20 @@ async function runLoop(
 				emit,
 				streamFn,
 				{
-					// PLAN mode: force a tool call (once past the time budget, force `plan` specifically).
-					// IMPLEMENT mode: force a tool call so the model must emit edit / write / editdone.
-					toolChoice:
-						executionMode === "plan" && !planSubmitted
-							? planWarningExceeded
-								? ({ type: "function", function: { name: "plan" } } as const)
-								: ("required" as const)
-							: executionMode === "implement"
-								? ("required" as const)
-								: undefined,
+					toolChoice: streamToolChoice,
+					/** PLAN mode rebuilds history from `planModeHead` + discovery steps — do not append here. */
+					mutateMessages: executionMode !== "plan",
 				},
 				llmSystemPrompt,
 			);
-			newMessages.push(message);
+			if (executionMode !== "plan") {
+				newMessages.push(message);
+			}
 
 			if (message.stopReason === "aborted") {
+				if (executionMode === "plan") {
+					appendPlanModeAssistantOnly(message);
+				}
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -1687,6 +1768,9 @@ async function runLoop(
 			if (message.stopReason === "error") {
 				if (upstreamRetries < UPSTREAM_RETRY_LIMIT) {
 					upstreamRetries++;
+					if (executionMode === "plan") {
+						appendPlanModeAssistantOnly(message);
+					}
 					await emit({ type: "turn_end", message, toolResults: [] });
 					pendingMessages.push({
 						role: "user",
@@ -1700,6 +1784,9 @@ async function runLoop(
 					});
 					hasMoreToolCalls = false;
 					continue;
+				}
+				if (executionMode === "plan") {
+					appendPlanModeAssistantOnly(message);
 				}
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
@@ -1715,12 +1802,16 @@ async function runLoop(
 			}
 			hasMoreToolCalls = toolCalls.length > 0;
 			const hasPlanToolCall = toolCalls.some((tc) => tc.name === "plan");
+			if (hasPlanToolCall) {
+				planDiscoveryDuplicateOnlyStreak = 0;
+			}
 			const toolResults: ToolResultMessage[] = [];
 			if (executionMode === "plan") {
 				if (hasPlanToolCall && expectedFiles.length > 0 && !planWarningExceeded) {
 					const undiscovered = undiscoveredExpectedFiles();
 					if (undiscovered.length > 0) {
 						await emit({ type: "turn_end", message, toolResults: [] });
+						appendPlanModeAssistantOnly(message);
 						pendingMessages.push({
 							role: "user",
 							content: [{
@@ -1750,6 +1841,7 @@ async function runLoop(
 					});
 					if (hasMutationAttempt) {
 						await emit({ type: "turn_end", message, toolResults: [] });
+						appendPlanModeAssistantOnly(message);
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: "Still in PLAN mode. File mutations are forbidden before plan submission (`edit`/`write` and mutating `bash` commands). Continue broad discovery and then call `plan` with exact JSON format." }],
@@ -1760,6 +1852,7 @@ async function runLoop(
 					}
 					if (hasNetworkProbe) {
 						await emit({ type: "turn_end", message, toolResults: [] });
+						appendPlanModeAssistantOnly(message);
 						pendingMessages.push({
 							role: "user",
 							content: [{ type: "text", text: "PLAN mode forbids network/probe bash commands (they often fail with ConnectionRefusedError in eval sandboxes). Use only local repository discovery tools and then call `plan` with exact JSON format." }],
@@ -1771,6 +1864,7 @@ async function runLoop(
 				}
 				if ((Date.now() - loopStart) >= PLAN_MODE_WARNING_MS && pendingMessages.length === 0 && !hasPlanToolCall) {
 					await emit({ type: "turn_end", message, toolResults: [] });
+					appendPlanModeAssistantOnly(message);
 					pendingMessages.push({
 						role: "user",
 						content: [{ type: "text", text: "Plan mode timeout reached (~100s). Stop exploration now. Do one final coverage check (each criterion -> file) and call only the `plan` tool with detailed JSON plans." }],
@@ -1781,6 +1875,7 @@ async function runLoop(
 				}
 				if (!hasMoreToolCalls) {
 					await emit({ type: "turn_end", message, toolResults: [] });
+					appendPlanModeAssistantOnly(message);
 					pendingMessages.push({
 						role: "user",
 						content: [
@@ -1798,6 +1893,7 @@ async function runLoop(
 					const disallowed = toolCalls.filter((tc) => !planAllowed.has(tc.name));
 					if (disallowed.length > 0) {
 						await emit({ type: "turn_end", message, toolResults: [] });
+						appendPlanModeAssistantOnly(message);
 						const blocked = disallowed.map((tc) => `\`${tc.name}\``).join(", ");
 						const allowList = [...planAllowed].map((n) => `\`${n}\``).join(", ");
 						pendingMessages.push({
@@ -1830,9 +1926,42 @@ async function runLoop(
 							? await executePlanModeToolBatchWithHandshake(message, toolCalls)
 							: await executeToolCalls(currentContext, message, config, signal, emit, loopStart)),
 					);
-					for (const result of toolResults) {
-						currentContext.messages.push(result);
-						newMessages.push(result);
+					const discoveryOnlyPlanTurn =
+						toolCalls.length > 0 &&
+						toolCalls.every((tc) => tc.type === "toolCall" && isPlanDiscoveryToolName(tc.name)) &&
+						!hasPlanToolCall;
+					if (discoveryOnlyPlanTurn) {
+						const dedupeStats = appendPlanModeDiscoveryDeduped(message, toolCalls, toolResults);
+						const duplicateOnlyBatch =
+							dedupeStats.batchSize > 0 && dedupeStats.replacedCount === dedupeStats.batchSize;
+						if (duplicateOnlyBatch) {
+							planDiscoveryDuplicateOnlyStreak++;
+							if (
+								planDiscoveryDuplicateOnlyStreak >= PLAN_DISCOVERY_DUPLICATE_STREAK_LIMIT
+							) {
+								pendingMessages.push({
+									role: "user",
+									content: [{
+										type: "text",
+										text:
+											"Discovery loop hard-stop: you repeatedly called discovery tools with the same normalized payload and got duplicate context. " +
+											"Stop repeating the same discovery calls. Call `plan` now using current evidence. " +
+											"If a path is still uncertain, run one targeted non-duplicate discovery call first, then call `plan`.",
+									}],
+									timestamp: ((Date.now() - loopStart) / 1000),
+								});
+								void emitRolloutMarker("plan_duplicate_discovery_hard_stop", {
+									streak: planDiscoveryDuplicateOnlyStreak,
+									limit: PLAN_DISCOVERY_DUPLICATE_STREAK_LIMIT,
+									tool_calls_in_batch: dedupeStats.batchSize,
+								});
+							}
+						} else {
+							planDiscoveryDuplicateOnlyStreak = 0;
+						}
+					} else {
+						planDiscoveryDuplicateOnlyStreak = 0;
+						appendPlanModeNonDiscoveryTurn(message, toolResults);
 					}
 
 					for (let bi = 0; bi < toolResults.length; bi++) {
@@ -2369,6 +2498,9 @@ async function runLoop(
 					reason: "invariant_correction",
 				});
 				executionMode = "plan";
+				planModeHead.splice(0, planModeHead.length, ...currentContext.messages);
+				planDiscoverySteps.length = 0;
+				commitPlanModeMessages();
 				pendingMessages = [{
 					role: "user",
 					content: [{
@@ -2406,6 +2538,8 @@ async function runLoop(
  */
 type StreamOverrideOptions = {
 	toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
+	/** When false, the assistant message is not appended to \`context.messages\` (PLAN mode rebuild). Default true. */
+	mutateMessages?: boolean;
 };
 
 async function streamAssistantResponse(
@@ -2418,6 +2552,7 @@ async function streamAssistantResponse(
 	/** When set (e.g. τ dual-prompt mode), overrides \`context.systemPrompt\` for the LLM request only. */
 	llmSystemPrompt?: string,
 ): Promise<AssistantMessage> {
+	const mutateMessages = streamOverrides?.mutateMessages !== false;
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -2454,7 +2589,9 @@ async function streamAssistantResponse(
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;
-				context.messages.push(partialMessage);
+				if (mutateMessages) {
+					context.messages.push(partialMessage);
+				}
 				addedPartial = true;
 				await emit({ type: "message_start", message: { ...partialMessage } });
 				break;
@@ -2470,7 +2607,9 @@ async function streamAssistantResponse(
 			case "toolcall_end":
 				if (partialMessage) {
 					partialMessage = event.partial;
-					context.messages[context.messages.length - 1] = partialMessage;
+					if (mutateMessages) {
+						context.messages[context.messages.length - 1] = partialMessage;
+					}
 					await emit({
 						type: "message_update",
 						assistantMessageEvent: event,
@@ -2482,10 +2621,12 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await response.result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
+				if (mutateMessages) {
+					if (addedPartial) {
+						context.messages[context.messages.length - 1] = finalMessage;
+					} else {
+						context.messages.push(finalMessage);
+					}
 				}
 				if (!addedPartial) {
 					await emit({ type: "message_start", message: { ...finalMessage } });
@@ -2497,10 +2638,14 @@ async function streamAssistantResponse(
 	}
 
 	const finalMessage = await response.result();
-	if (addedPartial) {
-		context.messages[context.messages.length - 1] = finalMessage;
-	} else {
-		context.messages.push(finalMessage);
+	if (mutateMessages) {
+		if (addedPartial) {
+			context.messages[context.messages.length - 1] = finalMessage;
+		} else {
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: { ...finalMessage } });
+		}
+	} else if (!addedPartial) {
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
 	await emit({ type: "message_end", message: finalMessage });
