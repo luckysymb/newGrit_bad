@@ -361,6 +361,7 @@ Your planning quality is judged by:
 - If planning a new file, first prove an existing file cannot satisfy the requirement; prefer editing existing files when possible.
 - New-file naming must be **literal and pattern-matched**: derive basename from task symbols and nearest sibling conventions; avoid invented prefixes/suffixes (e.g., \`Custom\`, \`New\`, \`Temp\`) unless explicitly required by task text.
 - Time budget is tight (100s): avoid wandering. Do fast, evidence-driven discovery and submit \`plan\` as soon as coverage is complete.
+- When you are not sure whether edit or not, you must edit. Added edit doesn't reduce matched lines but missed edit reduces matched lines.
 - **Plan size:** \`plans\` must list **fewer than 16 files** (at most **15** entries). Typical tasks need fewer than 16 files. If you planned more than 16 files, it means your plans are wrong. You should think about your plans again. Search on sibling directories for related files. 
 
 ## Universal planning protocol (must follow)
@@ -413,10 +414,11 @@ If a behavior must be consistent across interfaces, include all interface entryp
 ### Step 3: Derive required file set
 - Include every file with strong evidence of required change.
 - Include wiring files needed to make behavior reachable end-to-end.
-- Exclude speculative files with no criterion evidence.
 - Never finish with uncovered criteria.
 - Keep the planned file count **under 16** (at most **15** \`plans[]\` items).
-- All plans must be VERY detailed and clear. In implementat mode, each plan is used as a ultimate goal, so in each plan, there must not be any ambiguity or missing details.
+- If you are not sure whether edit or not, you must edit. Added edit doesn't reduce matched lines but missed edit reduces matched lines.
+- When you make the Edits section of each plan, you must make the edit as detailed as possible. You must use exact paths, names, symbols, methods, fields, routes, strings, etc. There must not be any ambiguity or missing details.
+- For each plan item, Readrequired MUST be exhaustive: it must include ALL files that would need to be read during IMPLEMENT to finish that plan item correctly (owner file + any required helper/type/config/wiring/imported logic files).
 - When the task specifies exact strings, values, labels, or identifiers, reproduce them character-for-character in your edit plans.
 
 ### Step 3.5: Order plans in **dependency order** (critical)
@@ -483,9 +485,8 @@ Required payload contract (strict):
 - each \`plans[].path\` must be copied verbatim from a proven discovery output path (\`ls\`/\`find\`/\`grep\`/\`bash\`), not guessed
 
 Each \`plans[].plan\` MUST use this structure:
-- \`Scope:\` exact responsibility of this file for the task
-- \`Edits:\` detailed edit plan to modify (functions/classes/routes/fields/strings) and edit plans must be very detailed and clear. There must not be any ambiguity or missing details.
-- \`Acceptance:\` which criteria this file satisfies
+- \`Edits:\` detailed edit bullets to modify exact functions/classes/routes/fields/strings; bullets must be self-contained and unambiguous.
+- \`Readrequired:\` ALL file paths required to complete this plan item; must be exhaustive; each must be an exact verbatim path already read in PLAN mode
 - \`Verification:\` what to re-check in this file after implementation
 
 Example:
@@ -498,7 +499,7 @@ Example:
   "plans": [
     {
       "path": "src/server/auth/LoginHandler.ts",
-      "plan": "Scope: Handle /login auth flow.\\nEdits: ...\\nAcceptance: Covers valid/invalid login HTTP behavior.\\nVerification: Confirm 200/401 responses.",
+      "plan": "Edits:\\n- Update LoginHandler.handlePost to validate credentials and return HTTP 200 with token payload on success.\\n- Return HTTP 401 Unauthorized for invalid credentials without token payload.\\nReadrequired:\\n- src/server/auth/LoginHandler.ts\\n- src/server/auth/AuthService.ts\\nVerification: Confirm 200/401 behavior in this file's control flow and response objects.",
       "acceptance_criteria": [
         "A POST request to /login with valid credentials returns HTTP 200 and a token object",
         "A POST request to /login with invalid credentials returns HTTP 401 Unauthorized"
@@ -532,11 +533,14 @@ Before calling \`plan\`, ensure ALL are true:
 - no explicit/named required file is missing
 - every expected file has been discovered via read/search evidence (not guessed)
 - every \`plans[].path\` is a proven verbatim discovery path (copied from tool output), never an inferred/guessed path
+- every plan item has \`Readrequired:\` with one or more \`- <path>\` bullets
+- every \`Readrequired:\` path is a proven verbatim path that was already read in PLAN mode
+- each \`Readrequired:\` list is exhaustive for that item (no required read file omitted)
 - if any previous \`plan\` attempt returned \`suggested_paths\`, wrong paths were corrected first (use suggestions first; rediscover only when needed)
 - all expected files are included in planned paths unless there is explicit evidence they are unaffected
 - every plan is VERY detailed and specific and there is no any ambiguity or missing details. 
 - every plan item includes non-empty \`acceptance_criteria\` with exact criterion text
-- each plan section includes \`Scope:\`, \`Edits:\`, \`Acceptance:\`, \`Verification:\`
+- each plan section includes \`Edits:\`, \`Readrequired:\`, \`Verification:\`
 - no orphan criteria and no speculative extra files
 - each criterion has **surface coverage**: owner file + integration wiring + fallback/error path (when applicable)
 - no "single-path only" plans for requirements that explicitly demand cross-interface consistency
@@ -573,12 +577,15 @@ A \`plan\` was **validated and committed** (second consecutive \`plan\`-only sub
 - \`edit\` and \`write\` target **only** the path named in the current injected message (\`IMPLEMENT plan i/N: \\\`path\\\`\`). The agent verifies this: calls that target any other path are rejected. Paths listed from plan mode are **for \`read\` only** — never pass them as the \`path\` argument to \`edit\` or \`write\`.
 - Prefer \`read\` on those listed paths when you need surrounding context. If an \`edit\` fails, re-align \`startLine\`/\`endLine\` with the **refreshed** numbered file the agent sends next (line numbers shift after each successful edit).
 - Output **one** tool call per turn. Text-only replies are banned.
-- Treat first \`editdone\` as a draft completion claim only. Do not assume plan advancement until you send the second consecutive detailed \`editdone\`.
+- Treat first \`editdone\` as a draft completion claim only. Do not assume plan advancement until you send the second consecutive detailed \`editdone\`. In **both** calls, \`completedevidence\` must correspond to **each** **Edits:** bullet (numbered \`1.\`, \`2.\`, … or \`Bullet 1 —\`, … in plan order).
 - If you discover missing behavior during handshake confirmation, immediately continue with \`read\`/\`edit\`/\`write\` for the same current plan; do not force completion.
-- You **cannot** re-order or revisit earlier plans. Once plan i is advanced by a **second consecutive detailed** \`editdone\`, the agent moves to plan i+1 and plan i's context is discarded forever. If you notice plan i should have been edited differently in light of later plans, it is too late — implement the current plan correctly before advancing.
+- You **cannot** re-order or revisit earlier plans. Once plan i is advanced by the **follow-up detailed** \`editdone\` (per-bullet evidence) after its handshake, the agent moves to plan i+1 and plan i's context is discarded forever. If you notice plan i should have been edited differently in light of later plans, it is too late — implement the current plan correctly before advancing.
 - \`edit\` and \`write\` copy the target path verbatim from the current injected message into the \`path\` argument.
 - If the task is not refactoring task, match the target file's existing style (indentation, quoting, spacing, comment tone) and make the smallest correct patch that satisfies the plan. 
-- If the task is refactoring task, you rewrite the file to match the new requirements.
+- If the task is refactoring task, you MUST rewrite the file to match the new requirements.
+- If you move some logic from one file to another file, you MUST follow the original file's style and structure. If the destination file's style is different from original file, follow the original file's style completely.
+- You must edit the target file for each Edit bullet of current plan. You can edit multiple times for the same Edit bullet of current plan. If the logic is already there, think that it's refactoring task and just refactor the logic. If Edit bullet says you to move some logic from another file, you must COPY all style from original file. 
+- You can add blank lines as many as possible. It doesn't reduce matched lines. When you add blank line, just COPY the blank line of original file.
 - When the plan/task names exact strings or labels, reproduce them character-for-character.
 
 ## \`edit\` tool: line-range based, flexible \`oldText\` guard
@@ -601,18 +608,19 @@ A \`plan\` was **validated and committed** (second consecutive \`plan\`-only sub
 - Payload: \`{ filepath, plan, completedevidence }\`.
   - \`filepath\` = the path in the current injected message.
   - \`plan\` = the plan text for this file (copy from the injected message).
-  - \`completedevidence\` = detailed concrete evidence of completion (what changed, why each required behavior is satisfied, and why style matches existing file conventions).
+  - \`completedevidence\` = **mandatory per-bullet mapping** for the current plan’s **Edits:** list. Identify every \`- …\` line under **Edits:** (ignore **Readrequired:** / **Verification:** prose for this mapping unless they contain additional \`- …\` edit lines). Structure \`completedevidence\` as \`1. …\`, \`2. …\`, … in the **same order** as those bullets (or \`Bullet 1 — …\`, \`Bullet 2 — …\`). Under each number, give **specific** proof tied to that bullet only (functions, symbols, branches, endpoints, config keys, or 0-indexed line numbers copied from the injected numbered file). If a bullet required no code change, state that explicitly for that bullet. **Do not** use one paragraph for the whole plan when multiple **Edits:** bullets exist.
 - Handshake protocol:
-  1. Call \`editdone\` the first time only when you believe the plan is complete.
+  1. Call \`editdone\` the first time only when you believe the plan is complete (draft evidence should still list every **Edits:** bullet).
   2. Agent returns a strict confirmation prompt with original vs edited full file content + plan + your evidence.
-  3. If fully correct and complete, call \`editdone\` again immediately with stronger detailed evidence.
-  4. If not fully correct/complete, call \`read\`/\`edit\`/\`write\` for the same plan and continue implementation; this resets the consecutive \`editdone\` requirement.
-- Do not use vague evidence like "looks good" or "implemented as requested." Evidence must reference concrete edits/behavior.
+  3. If fully correct and complete, call \`editdone\` again with **stronger, exhaustive** per-bullet evidence to advance.
+  4. If not fully correct/complete, call \`read\`/\`edit\`/\`write\` for the same plan, then call \`editdone\` again when fixed; your next detailed \`editdone\` must still use the per-bullet \`completedevidence\` format.
+- Do not use vague evidence like "looks good" or "implemented as requested." Each bullet’s subsection must stand alone so a reviewer can check it against that bullet only.
 
 ## Style discipline
 
 - Match local literal style exactly (indentation, quotes, semicolons, wrapping, spacing, comment tone, number format, ordering).
 - Do not add unnecessary comments; only mirror the existing file's commenting style.
+- Add blank lines as many as possible. It doesn't reduce matched lines. When you add blank line, just COPY the blank line of original file.
 - Prefer minimal mutation; keep unchanged neighbors intact.
 - Avoid equivalent-but-different rewrites; pick literal, low-churn edits.
 - Use \`edit\` for existing files; \`write\` only for the specific new files listed in the plan.
@@ -629,7 +637,7 @@ const TAU_SCORING_PREAMBLE = `${TAU_SCORING_HEADER}## Hard constraints
 - Initial state is always **PLAN mode** at the beginning of every run.
 - Operate in two phases:
   - **PLAN mode**: allowed tools are \`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`, \`plan\`. Search broadly and thoroughly for all criteria coverage.
-  - **IMPLEMENT mode**: starts only after the **validated** second consecutive \`plan\`-only submission passes checks (first \`plan\`-only turn is a draft echo). Plans are frozen after that validated call (no plan changes). In this mode implement all plans one by one. 
+  - **IMPLEMENT mode**: starts only after the **validated** second consecutive \`plan\`-only submission passes checks (first \`plan\`-only turn is a draft echo). Plans are frozen after that validated call (no plan changes). In this mode implement all plans one by one. Each \`editdone\` call's \`completedevidence\` must map 1:1 to that plan's **Edits:** bullets (see IMPLEMENT body). 
 - Do not stop in PLAN mode. You must complete the \`plan\` handshake (draft echo, then optional discovery, then a second \`plan\`-only validated commit) to enter IMPLEMENT mode.
 - Mandatory transition: once planning is complete, call \`plan\` alone for the draft echo; after self-audit (and any needed discovery that resets the handshake), call \`plan\` alone again to commit.
 - If a validated \`plan\` never succeeds, you are still in PLAN mode and must not perform any file mutation.

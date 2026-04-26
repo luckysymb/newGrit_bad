@@ -597,7 +597,7 @@ async function runLoop(
 	/**
 	 * Handshake state for editdone:
 	 * first editdone -> send confirmation inject;
-	 * second consecutive detailed editdone on same plan -> advance.
+	 * follow-up detailed editdone (per-bullet evidence) on same plan -> advance.
 	 */
 	let pendingEditdoneConfirmationPlanIndex: number | null = null;
 	/**
@@ -708,7 +708,7 @@ async function runLoop(
 			`- \`read\` — optional context from the paths above or elsewhere (**read-only** on non-plan files)\n` +
 			`- \`edit\` — line-range replacements **only** on \`${filepath}\`\n` +
 			`- \`write\` — full overwrite/create **only** for \`${filepath}\`\n` +
-			`- \`editdone\` — signal this plan is complete (payload: { filepath: "${filepath}", plan: <plan text>, completedevidence: <short justification> })`;
+			`- \`editdone\` — signal this plan is complete (payload: { filepath: "${filepath}", plan: <plan text>, completedevidence: <one numbered subsection per **Edits:** bullet in plan order, each with concrete proof> })`;
 		return {
 			role: "user",
 			content: [{ type: "text", text: body }],
@@ -770,9 +770,6 @@ async function runLoop(
 			: "(file currently missing)";
 		const body =
 			`IMPLEMENT plan ${planIdx + 1}/${plannedOrder.length} EDITDONE HANDSHAKE CONFIRMATION: \`${p.path}\`\n\n` +
-			`You just called \`editdone\`. Confirm completion quality against this evidence before plan can advance.\n\n` +
-			`Current plan text:\n---\n${p.plan || "(no plan text)"}\n---\n\n` +
-			`First editdone completedevidence:\n---\n${completedevidence || "(empty)"}\n---\n\n` +
 			`Original target file content at plan start:\n` +
 			"```\n\n" +
 			escapeMarkdownFences(originalNumbered) +
@@ -781,8 +778,12 @@ async function runLoop(
 			"```\n\n" +
 			escapeMarkdownFences(editedNumbered) +
 			"\n```\n\n" +
+			`You just called \`editdone\`. Confirm completion quality against this evidence before plan can advance.\n\n` +
+			`Current plan text:\n---\n${p.plan || "(no plan text)"}\n---\n\n` +
+			`Map your next \`completedevidence\` to **every** \`- …\` line under **Edits:** above (same order, one labeled block per bullet).\n\n` +
+			`First editdone completedevidence:\n---\n${completedevidence || "(empty)"}\n---\n\n` +
 			`## IMPLEMENT MODE - EDITDONE QUALITY HANDSHAKE (NOT advanced yet)\n\n` +
-			`Your first \`editdone\` call is treated as a draft completion claim only. The plan does NOT advance until you pass this self-audit and then call a second consecutive \`editdone\` with detailed evidence.\n\n` +
+			`Your first \`editdone\` call is treated as a draft completion claim only. The plan does NOT advance until you pass this self-audit and then call \`editdone\` again with **detailed** per-bullet evidence. You may use \`read\`/\`edit\`/\`write\` in between if the checklist reveals gaps; those tools do not cancel this handshake.\n\n` +
 			`### Non-negotiable completion contract for this file\n` +
 			`- **Plan lock:** You must satisfy the current plan exactly as written for \`${p.path}\`. Do not broaden scope; do not skip any promised behavior.\n` +
 			`- **No hidden TODOs:** Any promised behavior that is not concretely implemented in the edited file is a failure of completion.\n` +
@@ -795,16 +796,17 @@ async function runLoop(
 			`3. **Code-level precision:** Are exact symbols, literals, branches, and data shapes aligned with what the plan demands?\n` +
 			`4. **No regressions:** Did this change avoid breaking unrelated behavior in this file's existing logic?\n` +
 			`5. **Style matching:** Does the edited file read like a natural continuation of the original coding style?\n` +
-			`6. **Evidence quality:** Can you provide specific before/after evidence tied to concrete lines and logic changes (not vague claims)?\n` +
-			`7. **Implement-mode discipline:** If any answer is NO, will you continue with a read/edit/write tool call now instead of forcing completion?\n\n` +
-			`### Evidence standard for second \`editdone\`\n` +
-			`Your second \`editdone\` \`completedevidence\` must be detailed and concrete. Include:\n` +
-			`- exact changes made (symbols/blocks/branches touched)\n` +
-			`- why those changes satisfy each required part of this plan\n` +
-			`- why style and structure remain consistent with the original file\n` +
-			`- why no remaining work is needed for this plan\n\n` +
+			`6. **Evidence quality:** Will your next \`completedevidence\` list **every** **Edits:** bullet in order (\`1.\` … \`N.\` or \`Bullet 1 —\` …), each with proof tied only to that bullet?\n` +
+			`7. **No BUG:** Did you check the code carefully and ensure there are no bugs in the code?\n\n` +
+			`### Evidence standard for the follow-up \`editdone\`\n` +
+			`Your follow-up \`editdone\` \`completedevidence\` must be **exhaustive and specific for each** \`- …\` line under **Edits:** in the plan (same order as the plan). Use a numbered or \`Bullet k —\` heading per bullet, then under each:\n` +
+			`- exact symbols / regions / branches / endpoints touched for **that** bullet only\n` +
+			`- why that bullet’s requirement is satisfied (no cross-bullets lumped together)\n` +
+			`- if the bullet was already satisfied before your edits, say so explicitly for that bullet\n` +
+			`- for style: note per-bullet only when that bullet implied style constraints; otherwise one short global style note is allowed **after** all bullet subsections\n` +
+			`- confirm no remaining work for **each** bullet\n\n` +
 			`### Call exactly ONE tool now\n` +
-			`- If and only if all checklist items pass: call \`editdone\` again with detailed completedevidence. Only this second consecutive detailed \`editdone\` advances to the next plan.\n` +
+			`- If and only if all checklist items pass: call \`editdone\` again with that per-bullet \`completedevidence\`. Only that follow-up detailed \`editdone\` advances to the next plan.\n` +
 			`- Otherwise: call \`read\`, \`edit\`, or \`write\` now to finish missing work for the current plan.\n`;
 		return {
 			role: "user",
@@ -813,11 +815,33 @@ async function runLoop(
 		};
 	};
 
-	const isDetailedCompletionEvidence = (text: string): boolean => {
+	const countEditsBulletsInPlan = (planText: string): number => {
+		const m = /\bEdits:\s*/i.exec(planText);
+		if (!m) return 0;
+		const rest = planText.slice(m.index + m[0].length);
+		const stopM = /\n\s*(?:Readrequired|Verification)\s*:/i.exec(rest);
+		const block = stopM ? rest.slice(0, stopM.index) : rest;
+		const lines = block.match(/^\s*-\s/gm);
+		return lines ? lines.length : 0;
+	};
+
+	const countPerBulletEvidenceHeadings = (evidence: string): number => {
+		const numbered = (evidence.match(/(?:^|\n)\s*\d+[\.)]\s+\S/g) ?? []).length;
+		const bulletWord = (evidence.match(/(?:^|\n)\s*Bullet\s+\d+\s*[—:-]/gi) ?? []).length;
+		return Math.max(numbered, bulletWord);
+	};
+
+	const isDetailedCompletionEvidence = (text: string, planText: string): boolean => {
 		const t = text.trim();
 		if (t.length < 60) return false;
 		const wordCount = t.split(/\s+/).filter((w) => w.length > 0).length;
-		return wordCount >= 12;
+		if (wordCount < 12) return false;
+		const planBullets = countEditsBulletsInPlan(planText);
+		if (planBullets <= 1) return true;
+		const minLen = Math.min(12_000, Math.max(120, 40 * planBullets));
+		if (t.length < minLen) return false;
+		const headings = countPerBulletEvidenceHeadings(t);
+		return headings >= planBullets;
 	};
 
 	/**
@@ -1063,11 +1087,12 @@ async function runLoop(
 			`This is intentional: your first job is to **brutally self-audit** your draft against the **official** task acceptance criteria below (from the injected task / system prompt — **not** taken from your tool arguments). Do not trust the strings you put in \`task_acceptance_criteria\` until they match this list **exactly**.\n\n` +
 			`### IMPLEMENT-mode contract (non-negotiable — read as law)\n` +
 			`After your **validated** second \`plan\`-only submission, the agent enters **IMPLEMENT** mode. There you must **complete every official acceptance criterion** using **only** what is already frozen in your plans — **not** by treating implement mode as a second discovery pass.\n\n` +
-			`- **No “research to finish the spec”:** You must **not** depend on exploratory \`grep\`, broad \`read\` sweeps, or guessing owners/symbols to figure out what the task meant. Anything required to pass a criterion must already appear in the matching \`plans[].plan\` (**Scope / Edits / Acceptance / Verification**).\n` +
+			`- **No “research to finish the spec”:** You must **not** depend on exploratory \`grep\`, broad \`read\` sweeps, or guessing owners/symbols to figure out what the task meant. Anything required to pass a criterion must already appear in the matching \`plans[].plan\` (**Edits / Readrequired / Verification**).\n` +
 			`- **Reads are local glue only:** In implement mode, \`read\` exists only to refresh exact file text or skim **already-scoped** neighbors (imports, small helpers) for the **current** planned file — **not** to replace missing \`Edits:\` detail you should have written here in PLAN mode.\n` +
 			`- **Path proof policy (NON-NEGOTIABLE):** every path used in \`read\` and every \`plans[].path\` must be an **EXACT verbatim discovery-proven path** copied from \`ls\`/\`find\`/\`grep\`/\`bash\` output. Guessed or inferred paths are invalid.\n` +
 			`- **Path-not-found handling:** if \`read\` fails with path-not-found, re-run discovery first and copy the proven path character-for-character; never retry with another guessed variant.\n` +
 			`- **Every \`Edits:\` bullet is an executable contract:** Each bullet must be **self-contained**: a competent engineer (or another LLM) can perform that edit **without opening unrelated files to infer intent**. Name **concrete** types, methods, fields, routes, HTTP status codes, JSON property names, zip glob patterns, directories, and before→after behavior.\n` +
+			`- **Readrequired is exhaustive (hard requirement):** For each plan item, \`Readrequired:\` must list **ALL** files needed to implement that item during IMPLEMENT (including the item's own \`path\` and any required helper/type/config/wiring files). If any needed read file is missing, the plan is incomplete.\n` +
 			`- **Ban vague edit language:** Phrases like “wire up appropriately”, “ensure authentication works”, “handle errors”, “update as needed”, “integrate with the system”, or “add support for X” **without** naming the exact symbol and change are **forbidden** — rewrite into precise mechanical steps.\n\n` +
 			`### OFFICIAL task acceptance criteria (from the task)\n${officialCriteriaBlock}\n\n` +
 			`### Mandatory self-review (answer internally with YES/NO — any NO means you are NOT ready to commit)\n` +
@@ -1083,12 +1108,13 @@ async function runLoop(
 			`---\n` +
 			`### SELF-AUDIT CHECKLIST (answer every point internally before your next action)\n` +
 			`1. **Criterion → bullet trace (NON-NEGOTIABLE):** For **each** official criterion, list the **exact** \`Edits:\` bullet(s) (quote their opening phrase) that implement it, and the \`plans[].path\` for each. If any criterion lacks a bullet-level trace, your plan is **incomplete**.\n` +
-			`2. **Implement-without-discovery test:** For each plan item, cover the \`path\` column on your screen and ask: “Could I implement **only** from \`Scope\`+\`Edits\`+\`Acceptance\`+\`Verification\`?” If **no**, expand \`Edits:\` until **yes**.\n` +
+			`2. **Implement-without-discovery test:** For each plan item, cover the \`path\` column on your screen and ask: “Could I implement **only** from \`Edits\`+\`Readrequired\`+\`Verification\`?” If **no**, expand \`Edits:\` until **yes**.\n` +
 			`3. **Right file, right symbol:** Every symbol named in \`Edits:\` for an item must **live in** that item’s \`path\` (or be a type explicitly imported there). No “edit method M in file F” when M is actually in another file.\n` +
 			`4. **Literal fidelity:** Every task literal that affects runtime (paths, globs like \`devtools*.zip\`, HTTP codes, directory names like **debug**, strings) appears **verbatim** in the relevant plan text where it matters.\n` +
 			`5. **Verbatim proven paths:** Every \`plans[].path\` is copied character-for-character from proven discovery output (\`ls\`/\`find\`/\`grep\`/\`bash\`). No guessed folders, no guessed filenames, no “probably this path”.\n` +
-			`6. **Ordering:** \`plans[]\` is **dependency / leaf-first** (new leaves before consumers, wiring last) for sequential implement mode.\n` +
-			`7. **New vs existing files:** \`is_new_file\` matches disk reality for every path.\n\n` +
+			`6. **Readrequired contract:** Every plan item includes \`Readrequired:\` with ALL files needed to implement that item (exhaustive), each listed path was already read in PLAN mode using an exact discovery-proven path.\n` +
+			`7. **Ordering:** \`plans[]\` is **dependency / leaf-first** (new leaves before consumers, wiring last) for sequential implement mode.\n` +
+			`8. **New vs existing files:** \`is_new_file\` matches disk reality for every path.\n\n` +
 			`---\n` +
 			`### WHAT TO DO NEXT (strict handshake)\n` +
 			`- If you still need **repository evidence to write those concrete bullets**, call **\`read\` / \`grep\` / \`find\` / \`ls\` / \`bash\`** **now** in PLAN mode. **Any turn that includes a tool other than \`plan\` resets this handshake** — your next \`plan\`-only turn becomes a fresh draft echo.\n` +
@@ -2071,9 +2097,10 @@ async function runLoop(
 											`1) Use exact payload keys: \`task_acceptance_criteria\`, \`plans\`, and for each plan item: \`path\`, \`plan\`, \`acceptance_criteria\`, \`is_new_file\`.\n` +
 											`2) Ensure \`plans\` is non-empty and under the max file cap.\n` +
 											`3) Ensure each \`plans[].acceptance_criteria\` is non-empty and maps to official task criteria.\n` +
-											`4) Ensure each \`plans[].plan\` is implement-ready with explicit \`Scope:\`, \`Edits:\`, \`Acceptance:\`, \`Verification:\`.\n` +
+											`4) Ensure each \`plans[].plan\` is implement-ready with explicit \`Edits:\`, \`Readrequired:\`, \`Verification:\`.\n` +
 											`5) Ensure every \`plans[].path\` is an EXACT verbatim path proven by \`ls\`/\`find\`/\`grep\` output (no guessed paths).\n` +
-											`6) Ensure \`is_new_file\` is correct for each path.\n\n` +
+											`6) Ensure each \`Readrequired:\` list is exhaustive for that item (ALL files needed to implement it).\n` +
+											`7) Ensure \`is_new_file\` is correct for each path.\n\n` +
 											`Then call \`plan\` again (tool call only).`,
 									}],
 									timestamp: ((Date.now() - loopStart) / 1000),
@@ -2120,7 +2147,7 @@ async function runLoop(
 											`- Correct every failed path using EXACT verbatim discovery-proven paths only (\`ls\`/\`find\`/\`grep\` output), or set \`is_new_file\` appropriately.\n` +
 											`${strictPathCorrectionInstruction ? `- ${strictPathCorrectionInstruction}\n` : ""}` +
 											`- Ensure criteria coverage is complete and correctly mapped.\n` +
-											`- Keep each plan item fully implementable (no ambiguity in \`Edits:\`).\n` +
+											`- Keep each plan item fully implementable (no ambiguity in \`Edits:\`) and include exhaustive \`Readrequired:\` with exact previously-read paths.\n` +
 											`- Re-submit one corrected \`plan\` payload.`,
 									}],
 									timestamp: ((Date.now() - loopStart) / 1000),
@@ -2263,8 +2290,8 @@ async function runLoop(
 				//   3. After `edit`/`write` on the current plan path only, we execute the
 				//      tool and re-inject the (possibly updated) file content + plan
 				//      with the same "call edit/write/editdone" instruction.
-				//   4. After `editdone`, we advance to the next plan (or finish if the
-				//      model has called editdone once per plan).
+				//   4. After the two-step `editdone` handshake (draft + follow-up detailed),
+				//      advance to the next plan or finish.
 				if (currentPlanIndex >= plannedOrder.length) {
 					await emit({ type: "turn_end", message, toolResults: [] });
 					await emit({ type: "agent_end", messages: newMessages });
@@ -2281,7 +2308,8 @@ async function runLoop(
 							type: "text",
 							text:
 								`You must call a tool. For the current plan (\`${currentPlan.path}\`), call \`read\`, \`edit\`, \`write\`, or \`editdone\` now. ` +
-								`\`edit\` and \`write\` must target the current plan file: \`${currentPlan.path}\`; plan-mode paths are for \`read\` only.`,
+								`\`edit\` and \`write\` must target the current plan file: \`${currentPlan.path}\`; plan-mode paths are for \`read\` only. ` +
+								`For \`editdone\`, \`completedevidence\` must map 1:1 to each **Edits:** bullet (numbered subsections in plan order).`,
 						}],
 						timestamp: ((Date.now() - loopStart) / 1000),
 					});
@@ -2323,10 +2351,6 @@ async function runLoop(
 
 				// Did the model signal the current plan is done?
 				const hasEditdone = toolCalls.some((tc) => tc.name === "editdone");
-				// "Twice in a row" semantics: any non-editdone turn resets pending confirmation.
-				if (!hasEditdone && pendingEditdoneConfirmationPlanIndex === currentPlanIndex) {
-					pendingEditdoneConfirmationPlanIndex = null;
-				}
 				if (hasEditdone) {
 					const firstEditdoneCall = toolCalls.find((tc) => tc.name === "editdone");
 					const firstEditdoneArgs = (firstEditdoneCall?.arguments ?? {}) as Record<string, unknown>;
@@ -2334,7 +2358,7 @@ async function runLoop(
 						typeof firstEditdoneArgs.completedevidence === "string"
 							? firstEditdoneArgs.completedevidence
 							: "";
-					const evidenceDetailed = isDetailedCompletionEvidence(evidence);
+					const evidenceDetailed = isDetailedCompletionEvidence(evidence, currentPlan.plan);
 					const isSecondConsecutiveDetailedEditdone =
 						pendingEditdoneConfirmationPlanIndex === currentPlanIndex && evidenceDetailed;
 

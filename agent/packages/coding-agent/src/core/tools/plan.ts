@@ -7,9 +7,9 @@ import type { ToolDefinition } from "../extensions/types.js";
 import { resolveToCwd, resolveWorkspacePath } from "./path-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
-const MIN_PLAN_CHARS = 260;
+const MIN_PLAN_CHARS = 280;
 const MIN_PLAN_LINES = 4;
-const REQUIRED_PLAN_SECTIONS = ["Scope", "Edits", "Acceptance", "Verification"] as const;
+const REQUIRED_PLAN_SECTIONS = ["Edits", "Readrequired", "Verification"] as const;
 /** Real tasks almost always touch under 16 files; cap keeps plans from fragmenting into dozens of micro-edits. */
 const MAX_PLAN_ITEMS = 15;
 const planItemSchema = Type.Object(
@@ -113,7 +113,35 @@ function validatePlanDetailText(planText: string): { ok: boolean; reason?: strin
 	if (missingSections.length > 0) {
 		return {
 			ok: false,
-			reason: `failed: missing required sections (${missingSections.join(", ")}). Required format: Scope:, Edits:, Acceptance:, Verification:`,
+			reason: `failed: missing required sections (${missingSections.join(", ")}). Required format: Edits:, Readrequired:, Verification:`,
+		};
+	}
+	const editBullets = extractSectionBullets(text, "Edits");
+	if (editBullets.length === 0) {
+		return {
+			ok: false,
+			reason: "failed: Edits section must contain at least one `- ...` bullet",
+		};
+	}
+	if (editBullets.some((b) => b.length < 40)) {
+		return {
+			ok: false,
+			reason:
+				"failed: each Edits bullet must be detailed/self-contained (>= 40 chars).",
+		};
+	}
+	const readrequiredBullets = extractSectionBullets(text, "Readrequired");
+	if (readrequiredBullets.length === 0) {
+		return {
+			ok: false,
+			reason: "failed: Readrequired section must contain at least one `- <path>` bullet",
+		};
+	}
+	const dedup = new Set(readrequiredBullets.map((p) => normalizeRepoRelativePath(p)));
+	if (dedup.size !== readrequiredBullets.length) {
+		return {
+			ok: false,
+			reason: "failed: Readrequired contains duplicate paths; list each required file exactly once",
 		};
 	}
 	return { ok: true };
@@ -122,20 +150,31 @@ function validatePlanDetailText(planText: string): { ok: boolean; reason?: strin
 function addMissingRequiredSections(planText: string, acceptanceCriteria: string[]): string {
 	let text = planText.trim();
 	const hasSection = (name: string): boolean => new RegExp(`\\b${name}\\s*:`, "i").test(text);
-	if (!hasSection("Scope")) {
-		text += "\n\nScope: Implement the required behavior for this file.";
-	}
 	if (!hasSection("Edits")) {
-		text += "\nEdits: Update the concrete symbols/blocks required by the task.";
+		text += "\n\nEdits:\n- Update concrete symbols/blocks required by the task (name exact functions, fields, routes, literals, and before/after behavior).";
 	}
-	if (!hasSection("Acceptance")) {
-		const crit = acceptanceCriteria.length > 0 ? acceptanceCriteria.join(" | ") : "Task acceptance criteria assigned to this file plan.";
-		text += `\nAcceptance: ${crit}`;
+	if (!hasSection("Readrequired")) {
+		text += "\n\nReadrequired:\n- <exact/path/from/discovery/that/was/read>";
 	}
 	if (!hasSection("Verification")) {
-		text += "\nVerification: Re-read this file and confirm all planned edits are present and consistent.";
+		const crit = acceptanceCriteria.length > 0 ? acceptanceCriteria.join(" | ") : "Task criteria mapped to this file plan.";
+		text += `\n\nVerification: Re-read this file and confirm all planned edits are present and consistent for criteria: ${crit}`;
 	}
 	return text;
+}
+
+function extractSectionBullets(planText: string, sectionName: string): string[] {
+	const m = new RegExp(`\\b${sectionName}\\s*:`, "i").exec(planText);
+	if (!m) return [];
+	const rest = planText.slice(m.index + m[0].length);
+	const nextSection = /\n\s*[A-Za-z][A-Za-z0-9_ -]*\s*:/.exec(rest);
+	const block = nextSection ? rest.slice(0, nextSection.index) : rest;
+	return block
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.startsWith("- "))
+		.map((line) => line.slice(2).trim())
+		.filter((line) => line.length > 0);
 }
 
 export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, PlanToolDetails> {
@@ -143,7 +182,7 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 		name: "plan",
 		label: "plan",
 		description:
-			`Submit PLAN->IMPLEMENT handoff JSON. Agent handshake: the **first** assistant turn that contains **only** this \`plan\` tool is a **draft** — the agent echoes your payload with a self-audit prompt and **does not** run validation yet. If you call **any** other tool on a later turn, that resets the handshake. The **second** assistant turn that contains **only** \`plan\` again runs full validation and may transition to IMPLEMENT. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Scope: ...\\nEdits: ...\\nAcceptance: ...\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. \`plans\` must be non-empty and have fewer than 16 items (at most ${MAX_PLAN_ITEMS}); each item must include all keys. The order of \`plans\` is load-bearing: implement mode iterates them sequentially and drops per-plan context after each one finishes, so submit them in dependency order (new leaf files first, consumers next, wiring/registration last).`,
+			`Submit PLAN->IMPLEMENT handoff JSON. Agent handshake: the **first** assistant turn that contains **only** this \`plan\` tool is a **draft** — the agent echoes your payload with a self-audit prompt and **does not** run validation yet. If you call **any** other tool on a later turn, that resets the handshake. The **second** assistant turn that contains **only** \`plan\` again runs full validation and may transition to IMPLEMENT. Required interface: { \"task_acceptance_criteria\": [\"...\"], \"plans\": [{ \"path\": \"relative/file/path\", \"plan\": \"Edits:\\n- ... detailed bullet ...\\nReadrequired:\\n- exact/path/from/discovery/that/was/read\\nVerification: ...\", \"acceptance_criteria\": [\"criterion covered by this plan item\"], \"is_new_file\": false }] }. \`plans\` must be non-empty and have fewer than 16 items (at most ${MAX_PLAN_ITEMS}); each item must include all keys. Readrequired is mandatory and exhaustive per item (must include ALL needed read files, including the item's own path). The order of \`plans\` is load-bearing: implement mode iterates them sequentially and drops per-plan context after each one finishes, so submit them in dependency order (new leaf files first, consumers next, wiring/registration last).`,
 		promptSnippet:
 			"Call plan with exact JSON interface: { task_acceptance_criteria: [...], plans: [{ path, plan, acceptance_criteria, is_new_file }] }. Order plans in dependency order — leaf files first, wiring last.",
 		promptGuidelines: [
@@ -156,7 +195,10 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 			"Each plan item must declare which acceptance criteria it covers via acceptance_criteria",
 			"Coverage validation is count-based: the number of task_acceptance_criteria must match criteria covered across plan items",
 			"When creating new files, use literal task/symbol names and nearest sibling naming patterns; avoid invented prefixes/suffixes unless explicitly requested",
-			"Each plan item must be implementation-ready and include sections: Scope:, Edits:, Acceptance:, Verification:",
+			"Each plan item must be implementation-ready and include sections: Edits:, Readrequired:, Verification: .",
+			"Under **Edits:** use one `- …` bullet per discrete change; each bullet must be fully self-contained with concrete symbols/steps so it is understandable.",
+			"Under **Readrequired:** list all file paths needed to complete this item; each path must be an exact verbatim path already read in PLAN mode and copied from discovery tools' output.",
+			"Readrequired must be exhaustive per plan item: include ALL files you must read during IMPLEMENT for that item (owner file + required helpers/types/config/wiring/import targets). Missing any needed file in Readrequired is a hard plan defect.",
 			"Set is_new_file=false for existing files and true only for files that must be newly created (basename must not already exist anywhere in the repo)",
 			"Order plans in DEPENDENCY ORDER (bottom-up / leaf-first): plans[] is executed sequentially and the agent drops per-plan context after each editdone, so later plans only see files on disk after earlier plans landed. Submit new leaf files (interfaces, DTOs, helpers) first, logic that uses them next, and wiring/registration/delegation last. If plan B references a symbol introduced by plan A, A must come before B.",
 			"Self-check ordering: for every prefix plans[0..N-1], every symbol referenced by those plans must already exist (either in the pre-existing repo or introduced by one of those earlier plans). If not, reorder.",
@@ -199,6 +241,11 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 				);
 			}
 			ensureShellValidationToolsAvailable();
+			const normalizedReadPathSet = new Set(
+				planModeReadPaths
+					.map((p) => normalizeRepoRelativePath(p))
+					.filter((p) => p.length > 0),
+			);
 			const autoNormalizedExistingPaths: string[] = [];
 			const autoNormalizedReadPathFixes: Array<{ from: string; to: string }> = [];
 			const validationResults: PlanValidationResult[] = normalized.map((item) => {
@@ -219,6 +266,41 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 						validation_result: "failed",
 						message: detailValidation.reason ?? "failed: insufficient plan detail",
 					};
+				}
+				const readrequiredPaths = extractSectionBullets(normalizedPlanText, "Readrequired");
+				for (const rrPathRaw of readrequiredPaths) {
+					let rrPath = rrPathRaw;
+					const rrNorm = normalizeRepoRelativePath(rrPath);
+					if (!normalizedReadPathSet.has(rrNorm)) {
+						const alphaOnlyMatches = findAlphaOnlyFullPathMatchesInReadPaths(planModeReadPaths, rrPath, 20);
+						if (alphaOnlyMatches.length === 1) {
+							rrPath = alphaOnlyMatches[0];
+						} else {
+							const flexibleMatches = findFlexibleMatchesInReadPaths(planModeReadPaths, rrPath, 20);
+							if (flexibleMatches.length === 1) {
+								rrPath = flexibleMatches[0];
+							}
+						}
+					}
+					if (!normalizedReadPathSet.has(normalizeRepoRelativePath(rrPath))) {
+						return {
+							path: item.path,
+							is_new_file: item.is_new_file,
+							validation_result: "failed",
+							message:
+								`failed: Readrequired path must be already read in PLAN mode (exact or auto-normalizable from read paths): ${rrPathRaw}`,
+						};
+					}
+					const rrResolved = resolveWorkspacePath(rrPath, cwd, { kind: "file", basenameFallback: false });
+					const rrAbs = resolveToCwd(rrResolved, cwd);
+					if (!fileExistsViaTest(rrAbs)) {
+						return {
+							path: item.path,
+							is_new_file: item.is_new_file,
+							validation_result: "failed",
+							message: `failed: Readrequired path does not exist as file: ${rrPathRaw}`,
+						};
+					}
 				}
 				const resolved = resolveWorkspacePath(item.path, cwd, { kind: "file", basenameFallback: false });
 				const abs = resolveToCwd(resolved, cwd);
@@ -348,7 +430,7 @@ export function createPlanToolDefinition(): ToolDefinition<typeof planSchema, Pl
 						type: "text",
 						text: allPassed
 							? `Plan validation passed for all ${normalized.length} file(s).\n${normalizationNote}${readPathFixNote}Validation_result:\n${reportLines.join("\n")}`
-							: `Plan validation failed. Fix failed paths/criteria coverage and call plan again.\nEach plan item must be detailed and include sections: Scope:, Edits:, Acceptance:, Verification:.\n${normalizationNote}${readPathFixNote}${!criteriaAllCovered ? `Uncovered acceptance criteria: ${uncoveredCriteria.slice(0, 15).join(" | ")}\n` : ""}Validation_result:\n${reportLines.join("\n")}`,
+							: `Plan validation failed. Fix failed paths/criteria coverage and call plan again.\nEach plan item must be detailed and include sections: Edits:, Readrequired:, Verification:.\n${normalizationNote}${readPathFixNote}${!criteriaAllCovered ? `Uncovered acceptance criteria: ${uncoveredCriteria.slice(0, 15).join(" | ")}\n` : ""}Validation_result:\n${reportLines.join("\n")}`,
 					},
 				],
 				details: {

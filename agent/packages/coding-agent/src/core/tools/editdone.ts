@@ -14,7 +14,9 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
  * and evidence) and asks the model to either:
  *   - call `editdone` again with stronger detailed evidence, or
  *   - continue implementation via `read`/`edit`/`write`.
- * Only a second consecutive detailed `editdone` advances to the next plan.
+ * A later detailed `editdone` after that handshake advances to the next plan.
+ * `completedevidence` is expected to map 1:1 to each `- …` line under **Edits:**
+ * in the frozen plan (see system prompt and agent-loop handshake text).
  * The run ends only after that handshake completes for every planned file.
  *
  * The tool itself performs no filesystem work — it just echoes back a
@@ -30,7 +32,7 @@ const editdoneSchema = Type.Object(
 		}),
 		completedevidence: Type.String({
 			description:
-				"Detailed completion evidence: concrete symbols/behaviors changed, why the plan is fully satisfied, and why style matches surrounding code. Used by the per-plan two-step editdone handshake.",
+				"Per-plan-edit-bullet evidence: structured text that maps 1:1 to every `- …` line under **Edits:** in the current plan (same file). For each bullet in order, quote or label the bullet, then give concrete proof (symbols, functions, branches, literals, line ranges, or file regions) showing how the implementation satisfies that bullet. No merge/skip: N plan bullets ⇒ N clearly separated subsections. Completedevidence must be exhaustive and specific.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -52,16 +54,16 @@ export function createEditDoneToolDefinition(): ToolDefinition<
 		name: "editdone",
 		label: "editdone",
 		description:
-			"Signal completion in IMPLEMENT mode for the CURRENT planned file. This tool uses a two-step handshake: first `editdone` triggers strict confirmation; only a second consecutive detailed `editdone` advances to the next plan. Required payload: { filepath, plan, completedevidence }.",
+			"Signal completion in IMPLEMENT mode for the CURRENT planned file. Two-step handshake: first `editdone` triggers strict confirmation; a later detailed `editdone` advances (you may use read/edit/write in between). `completedevidence` must address every **Edits:** bullet in the current plan in order—one subsection per bullet with concrete proof. Required payload: { filepath, plan, completedevidence }.",
 		promptSnippet:
-			"IMPLEMENT handshake signal. Required: { filepath, plan, completedevidence }. First call = draft claim; second consecutive detailed call = advance.",
+			"IMPLEMENT handshake: { filepath, plan, completedevidence }. Evidence = one explicit block per Edits: bullet (numbered 1..N).",
 		promptGuidelines: [
 			"Only call `editdone` for the current planned file in IMPLEMENT mode.",
 			"`filepath` and `plan` must match the plan the agent is currently asking you to implement.",
 			"First `editdone` does not advance; it triggers a strict self-audit handshake in agent-loop.",
 			"If the handshake reveals missing work, continue with `read`/`edit`/`write` for the same plan.",
 			"Only the second consecutive `editdone` with detailed `completedevidence` advances the plan.",
-			"`completedevidence` must be concrete and specific (symbols/logic/behavior/style), not vague.",
+			"`completedevidence` must map 1:1 to each `- …` bullet under **Edits:** in that plan: use `1. …`, `2. …` (or `Bullet 1 —` / `Bullet 2 —`) in the same order as the plan. Under each entry cite concrete symbols, code regions, or behaviors—never a single vague paragraph for the whole file.",
 		],
 		parameters: editdoneSchema,
 		async execute(_toolCallId, input: EditDoneToolInput) {
@@ -75,7 +77,7 @@ export function createEditDoneToolDefinition(): ToolDefinition<
 							`editdone received for \`${filepath}\`.\n` +
 							`This is an IMPLEMENT handshake signal (state transitions happen in agent-loop).\n` +
 							`If this is the first editdone for the current plan, agent-loop will request strict confirmation.\n` +
-							`Evidence: ${completedevidence || "(none)"}`,
+							`Evidence (should list one subsection per **Edits:** bullet): ${completedevidence || "(none)"}`,
 					},
 				],
 				details: { filepath, completedevidence },
