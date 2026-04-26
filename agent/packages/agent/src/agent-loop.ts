@@ -789,6 +789,13 @@ async function runLoop(
 			`- **No hidden TODOs:** Any promised behavior that is not concretely implemented in the edited file is a failure of completion.\n` +
 			`- **Correctness over optimism:** If any uncertainty remains, continue implementing now via \`read\`/\`edit\`/\`write\`; do not advance with a weak \`editdone\`.\n` +
 			`- **Style consistency is mandatory:** Match local naming, formatting, control-flow style, error-handling conventions, and surrounding code patterns from the original file.\n` +
+			`	- Match local literal style exactly (indentation, quotes, semicolons, wrapping, spacing, comments style, number format, ordering, naming convention).\n` +
+			`	- Do not add unnecessary comments; You can add comments only when there were comments in the original line or plan says explicitly to add comments.\n` +
+			`	- Add blank lines as many as possible when you edit. It doesn't reduce matched lines. When you add blank line, just COPY the blank line of original file.\n` +
+			`	- Prefer minimal mutation; keep unchanged neighbors intact.\n` +
+			`	- If it's not refactoring task, avoid equivalent-but-different rewrites; pick literal, low-churn edits. If it's refactoring task, you must rewrite the file to match the new requirements.\n` +
+			`	- Use \`edit\` for existing files; \`write\` only for the specific new files listed in the plan.\n` +
+			`	- If the plan asks you to move some logic from one file to another file, you MUST follow the original file's style and structure. If the destination file's style is different from original file, follow the original file's style completely.\n` +
 			`- **Critical:** Add blank line as my as possible. It doesn't reduce matched lines. When you add blank line, just COPY the blank line of original file.\n\n` +
 			`### Mandatory self-review checklist (answer internally YES/NO)\n` +
 			`1. **Plan coverage:** Did you implement every required edit in the plan text (not just part of it)?\n` +
@@ -802,7 +809,7 @@ async function runLoop(
 			`Your follow-up \`editdone\` \`completedevidence\` must be **exhaustive and specific for each** \`- …\` line under **Edits:** in the plan (same order as the plan). Use a numbered or \`Bullet k —\` heading per bullet, then under each:\n` +
 			`- exact symbols / regions / branches / endpoints touched for **that** bullet only\n` +
 			`- why that bullet’s requirement is satisfied (no cross-bullets lumped together)\n` +
-			`- if the bullet was already satisfied before your edits, say so explicitly for that bullet\n` +
+			`- if the bullet was already satisfied before your edits, rewrite the whole logic with new style. If the bullet says that move the logic from another file, you must COPY all style from the original file.\n` +
 			`- for style: note per-bullet only when that bullet implied style constraints; otherwise one short global style note is allowed **after** all bullet subsections\n` +
 			`- confirm no remaining work for **each** bullet\n\n` +
 			`### Call exactly ONE tool now\n` +
